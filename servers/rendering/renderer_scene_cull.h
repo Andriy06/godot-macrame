@@ -877,7 +877,6 @@ public:
 	PagedArrayPool<RID> rid_cull_page_pool;
 
 	PagedArray<Instance *> instance_cull_result;
-	PagedArray<Instance *> instance_shadow_cull_result;
 
 	struct InstanceCullResult {
 		PagedArray<RenderGeometryInstance *> geometry_instances;
@@ -999,14 +998,14 @@ public:
 		}
 	};
 
-	InstanceCullResult scene_cull_result;
-	LocalVector<InstanceCullResult> scene_cull_result_threads;
+	// Macrame: the per-frame cull outputs live in a `RenderSceneCullFrame` (below); `scratch_frame`
+	// is the one the combined `render_camera` / `_render_scene` path (reflection probes, the
+	// non-split draw) culls into and draws from.
+	RenderSceneCullFrame *scratch_frame = nullptr;
+	bool tighter_caster_culling = true;
+	bool macrame_defer_device_update = false;
 
-	RendererSceneRender::RenderShadowData render_shadow_data[MAX_UPDATE_SHADOWS];
-	uint32_t max_shadows_used = 0;
 
-	RendererSceneRender::RenderSDFGIData render_sdfgi_data[SDFGI_MAX_CASCADES * SDFGI_MAX_REGIONS_PER_CASCADE];
-	RendererSceneRender::RenderSDFGIUpdateData sdfgi_update_data;
 
 	uint32_t thread_cull_threshold = 200;
 
@@ -1015,7 +1014,6 @@ public:
 	uint32_t geometry_instance_pair_mask = 0; // used in traditional forward, unnecessary on clustered
 
 	LocalVector<Vector2> camera_jitter_array;
-	RenderingLightCuller *light_culler = nullptr;
 
 	virtual RID instance_allocate();
 	virtual void instance_initialize(RID p_rid);
@@ -1075,9 +1073,9 @@ public:
 	_FORCE_INLINE_ void _update_instance_lightmap_captures(Instance *p_instance) const;
 	void _unpair_instance(Instance *p_instance);
 
-	void _light_instance_setup_directional_shadow(int p_shadow_index, Instance *p_instance, const Transform3D p_cam_transform, const Projection &p_cam_projection, bool p_cam_orthogonal, bool p_cam_vaspect);
+	void _light_instance_setup_directional_shadow(RenderSceneCullFrame &p_frame, int p_shadow_index, Instance *p_instance, const Transform3D p_cam_transform, const Projection &p_cam_projection, bool p_cam_orthogonal, bool p_cam_vaspect);
 
-	_FORCE_INLINE_ bool _light_instance_update_shadow(Instance *p_instance, const Transform3D p_cam_transform, const Projection &p_cam_projection, bool p_cam_orthogonal, bool p_cam_vaspect, RID p_shadow_atlas, Scenario *p_scenario, float p_screen_mesh_lod_threshold, uint32_t p_visible_layers = 0xFFFFFF);
+	_FORCE_INLINE_ bool _light_instance_update_shadow(RenderSceneCullFrame &p_frame, Instance *p_instance, const Transform3D p_cam_transform, const Projection &p_cam_projection, bool p_cam_orthogonal, bool p_cam_vaspect, RID p_shadow_atlas, Scenario *p_scenario, float p_screen_mesh_lod_threshold, uint32_t p_visible_layers = 0xFFFFFF);
 
 	RID _render_get_environment(RID p_camera, RID p_scenario);
 	RID _render_get_compositor(RID p_camera, RID p_scenario);
@@ -1119,7 +1117,7 @@ public:
 		SpinLock lock;
 
 		Frustum frustum;
-	} cull;
+	};
 
 	struct VisibilityCullData {
 		uint64_t viewport_mask;
@@ -1136,6 +1134,7 @@ public:
 
 	struct CullData {
 		Cull *cull = nullptr;
+		RenderSceneCullFrame *frame = nullptr;
 		Scenario *scenario = nullptr;
 		RID shadow_atlas;
 		Transform3D cam_transform;
@@ -1154,9 +1153,23 @@ public:
 	bool _render_reflection_probe_step(Instance *p_instance, int p_step);
 
 	void _render_scene(const RendererSceneRender::CameraData *p_camera_data, const Ref<RenderSceneBuffers> &p_render_buffers, RID p_environment, RID p_force_camera_attributes, RID p_compositor, uint32_t p_visible_layers, RID p_scenario, RID p_viewport, RID p_shadow_atlas, RID p_reflection_probe, int p_reflection_probe_pass, float p_screen_mesh_lod_threshold, float p_window_output_max_value, bool p_using_shadows = true, RenderingServerTypes::RenderInfo *r_render_info = nullptr);
+	// The two halves of `_render_scene`: everything up to the lists of what to draw, into
+	// `p_frame`; and the draw of a culled frame.
+	void _cull_scene(RenderSceneCullFrame &p_frame, const RendererSceneRender::CameraData *p_camera_data, const Ref<RenderSceneBuffers> &p_render_buffers, RID p_environment, RID p_force_camera_attributes, RID p_compositor, uint32_t p_visible_layers, RID p_scenario, RID p_viewport, RID p_shadow_atlas, RID p_reflection_probe, int p_reflection_probe_pass, float p_screen_mesh_lod_threshold, float p_window_output_max_value, bool p_using_shadows, RenderingServerTypes::RenderInfo *r_render_info);
+	void _draw_culled_scene(RenderSceneCullFrame &p_frame);
+	RenderSceneCullFrame *_cull_frame_new();
+	void _cull_frame_delete(RenderSceneCullFrame *p_frame);
 	void render_empty_scene(const Ref<RenderSceneBuffers> &p_render_buffers, RID p_scenario, RID p_shadow_atlas, float p_window_output_max_value);
 
 	void render_camera(const Ref<RenderSceneBuffers> &p_render_buffers, RID p_camera, RID p_scenario, RID p_viewport, Size2 p_viewport_size, uint32_t p_jitter_phase_count, float p_screen_mesh_lod_threshold, RID p_shadow_atlas, Ref<XRInterface> &p_xr_interface, float p_window_output_max_value, RenderingServerTypes::RenderInfo *r_render_info = nullptr);
+	virtual RenderSceneCullFrame *cull_frame_create() override;
+	virtual void cull_frame_free(RenderSceneCullFrame *p_frame) override;
+	virtual void cull_camera(RenderSceneCullFrame *p_frame, const Ref<RenderSceneBuffers> &p_render_buffers, RID p_camera, RID p_scenario, RID p_viewport, Size2 p_viewport_size, uint32_t p_jitter_phase_count, float p_screen_mesh_lod_threshold, RID p_shadow_atlas, Ref<XRInterface> &p_xr_interface, float p_window_output_max_value, RenderingServerTypes::RenderInfo *r_render_info = nullptr) override;
+	virtual void draw_culled(RenderSceneCullFrame *p_frame) override;
+	virtual bool cull_frame_matches(const RenderSceneCullFrame *p_frame, const Ref<RenderSceneBuffers> &p_render_buffers) const override;
+	virtual void macrame_set_defer_device_update(bool p_defer) override { macrame_defer_device_update = p_defer; }
+	virtual bool macrame_device_update_deferred() const override { return macrame_defer_device_update; }
+	virtual void macrame_device_update() override;
 	void update_dirty_instances() const;
 
 	void render_particle_colliders();
@@ -1415,4 +1428,46 @@ public:
 
 	RendererSceneCull();
 	virtual ~RendererSceneCull();
+};
+
+// Macrame: one frame's cull, from the camera to the lists of what to draw. Produced by the cull
+// node (`RenderingMethod::cull_camera`), consumed by the record node (`draw_culled`); the record
+// node is what touches the device, so nothing here is a device object - the mesh instances to
+// skin are a list, not a dispatch. Every array is pooled from the scene renderer's page pools, and
+// the frame is reused run after run.
+struct RenderSceneCullFrame {
+	// Inputs captured by the cull.
+	RID viewport;
+	RID scenario;
+	RID shadow_atlas;
+	RID environment;
+	RID camera_attributes; // Resolved: the forced one or the scenario's.
+	RID compositor;
+	RID reflection_probe;
+	RID reflection_atlas;
+	RID occluders_tex;
+	int reflection_probe_pass = -1;
+	uint32_t visible_layers = 0xFFFFFFFF;
+	Ref<RenderSceneBuffers> render_buffers;
+	RendererSceneRender::CameraData camera_data;
+	RendererSceneRender::CameraData prev_camera_data;
+	float screen_mesh_lod_threshold = 0.0f;
+	float window_output_max_value = 1.0f;
+	bool using_shadows = true;
+	RenderingServerTypes::RenderInfo *render_info = nullptr;
+	uint64_t render_pass = 0;
+	// Outputs.
+	RendererSceneCull::InstanceCullResult cull_result;
+	LocalVector<RendererSceneCull::InstanceCullResult> cull_result_threads;
+	RendererSceneCull::Cull cull;
+	Vector<RID> directional_lights;
+	RendererSceneRender::RenderShadowData render_shadow_data[RendererSceneCull::MAX_UPDATE_SHADOWS];
+	uint32_t max_shadows_used = 0;
+	RendererSceneRender::RenderSDFGIData render_sdfgi_data[RendererSceneCull::SDFGI_MAX_CASCADES * RendererSceneCull::SDFGI_MAX_REGIONS_PER_CASCADE];
+	RendererSceneRender::RenderSDFGIUpdateData sdfgi_update_data;
+	LocalVector<RID> mesh_instances_to_update; // Skinned meshes the draw must update before recording.
+	// Scratch of the cull itself.
+	PagedArray<RendererSceneCull::Instance *> shadow_cull_scratch;
+	RenderingLightCuller *light_culler = nullptr; // Owned by the frame.
+	bool culled = false; // Set by the cull, cleared by the draw.
 };

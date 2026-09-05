@@ -36,6 +36,7 @@
 #ifdef MACRAME_ENABLED
 #include "core/macrame/macrame_command_queue.h"
 #include "core/macrame/macrame_render_grant.h"
+#include "core/macrame/macrame_render_lists.h"
 #include "core/macrame/macrame_render_outputs.h"
 #include "servers/rendering/rendering_device_submit.h"
 #endif
@@ -137,6 +138,20 @@ class RenderingServerDefault : public RenderingServer {
 
 	void _macrame_render_node();
 	void _macrame_submit_node();
+
+	// The three-node render pipeline (results 2.16): `scene update` writes the render server,
+	// `cull` reads it and writes the lists, `record` reads both and writes the device's recording
+	// state. Same-run shape: the compiler derives update -> cull -> record from those declarations.
+	// MACRAME_RENDER_SPLIT=0 keeps the single `render` node for A/B.
+	bool split_render_nodes = false;
+	ts::Guarded<RecordGrantToken> record_guarded{ ts::Named{ "render_record" } };
+	ts::Guarded<MacrameRenderLists> lists_guarded{ ts::Named{ "render_lists" } };
+	void _macrame_update_node();
+	void _macrame_cull_node(MacrameRenderLists &p_lists);
+	void _macrame_record_node(const MacrameRenderLists &p_lists);
+	// `_draw` in two halves: the scene update (no device) and the record (everything else).
+	void _draw_update(double frame_step);
+	void _draw_record(bool p_swap_buffers, double frame_step, int p_handoff_slot);
 	// Registered with `MacrameScene::set_frame_render_nodes`; adds the two nodes to a graph.
 	static void _macrame_add_frame_nodes(void *p_graph);
 	// Shutdown: submit whatever the ring still holds, under the device grant.

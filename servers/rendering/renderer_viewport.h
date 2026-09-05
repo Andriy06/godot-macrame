@@ -37,6 +37,10 @@
 #include "servers/rendering/rendering_server_types.h"
 #include "servers/rendering/storage/render_scene_buffers.h"
 
+#ifdef MACRAME_ENABLED
+struct MacrameRenderLists;
+#endif
+
 class RendererViewport {
 public:
 	struct CanvasBase {
@@ -210,6 +214,12 @@ private:
 	void _configure_3d_render_buffers(Viewport *p_viewport);
 	void _draw_3d(Viewport *p_viewport);
 	void _draw_viewport(Viewport *p_viewport);
+#ifdef MACRAME_ENABLED
+	// The record node's view of what the cull node prepared; null outside the record node (the
+	// non-split draw), in which case `_draw_3d` culls and draws in one go.
+	const MacrameRenderLists *record_lists = nullptr;
+	uint32_t macrame_cull_fallbacks = 0; // 3D viewports drawn through the combined path.
+#endif
 	DisplayServerEnums::WindowID _get_containing_window(Viewport *p_viewport);
 
 	int occlusion_rays_per_thread = 512;
@@ -314,6 +324,14 @@ public:
 	void handle_timestamp(String p_timestamp, uint64_t p_cpu_time, uint64_t p_gpu_time);
 
 	void draw_viewports(bool p_swap_buffers);
+#ifdef MACRAME_ENABLED
+	// The cull node: every visible 3D viewport's cull into `r_lists`, device-free. Viewports the
+	// cull cannot prepare (no render buffers yet, XR, canvas background) are left to
+	// `draw_viewports`, which then culls them itself.
+	void macrame_cull_viewports(MacrameRenderLists &r_lists);
+	void macrame_set_record_lists(const MacrameRenderLists *p_lists) { record_lists = p_lists; }
+	uint32_t macrame_get_cull_fallbacks() const { return macrame_cull_fallbacks; }
+#endif
 
 	bool free(RID p_rid);
 

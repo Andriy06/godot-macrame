@@ -51,6 +51,7 @@ struct RenderGrantToken {
 
 extern thread_local bool macrame_tls_holds_render_grant;
 extern thread_local bool macrame_tls_holds_render_device_grant;
+extern thread_local bool macrame_tls_holds_record_grant;
 extern thread_local bool macrame_tls_holds_physics_grant;
 
 namespace MacrameRender {
@@ -85,15 +86,36 @@ bool check_access();
 // is an API gap; given such a query this type collapses into it.
 struct Inherited_grant_scope {
 	const bool previous;
-	Inherited_grant_scope() :
-			previous(holds_grant()) {
-		set_holds_grant(true);
-	}
-	~Inherited_grant_scope() { set_holds_grant(previous); }
+	const bool previous_record;
+	Inherited_grant_scope();
+	~Inherited_grant_scope();
 	Inherited_grant_scope(const Inherited_grant_scope &) = delete;
 	Inherited_grant_scope &operator=(const Inherited_grant_scope &) = delete;
 };
 } // namespace MacrameRender
+
+// The recording grant: the device's recording state - the frame graph being recorded into, its
+// draw and compute lists, the uniform sets, pipelines and per-frame buffers a frame creates - as a
+// guarded object of its own, split off the render grant. The three-node render pipeline needs it:
+// the scene update writes the render server, the cull reads it, and only the record node may
+// record into the device, which is what this token says. `RenderingDeviceGraph`'s owner check
+// asks for it on the recording side; the render grant no longer opens the graph.
+struct RecordGrantToken {
+	int unused = 0;
+};
+
+namespace MacrameRecord {
+inline bool holds_grant() {
+	return macrame_tls_holds_record_grant;
+}
+void set_holds_grant(bool p_holds);
+void set_token(RecordGrantToken *p_token);
+// True when the caller holds the recording grant (the record node, or a body that holds both
+// grants: the single render node, the synchronous draw) or when nothing is registered yet (device
+// initialization, shutdown); otherwise the harness checks the running task's grants against the
+// token and faults with its own diagnostics.
+bool check_access();
+} // namespace MacrameRecord
 
 // The split draw's second guarded object is `RenderingDeviceSubmit` itself: the frame slot being
 // submitted, the graph being replayed, the queue and the fence bookkeeping. It is the payload of

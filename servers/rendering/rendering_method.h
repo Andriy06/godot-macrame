@@ -44,6 +44,7 @@ class XRInterface;
 
 class Image;
 class RenderSceneBuffers;
+struct RenderSceneCullFrame; // Macrame: a scene renderer's per-frame cull output (renderer_scene_cull.h).
 
 class RenderingMethod {
 public:
@@ -351,6 +352,21 @@ public:
 	virtual void render_empty_scene(const Ref<RenderSceneBuffers> &p_render_buffers, RID p_scenario, RID p_shadow_atlas, float p_window_output_max_value) = 0;
 
 	virtual void render_camera(const Ref<RenderSceneBuffers> &p_render_buffers, RID p_camera, RID p_scenario, RID p_viewport, Size2 p_viewport_size, uint32_t p_jitter_phase_count, float p_mesh_lod_threshold, RID p_shadow_atlas, Ref<XRInterface> &p_xr_interface, float p_window_output_max_value, RenderingServerTypes::RenderInfo *r_render_info = nullptr) = 0;
+
+	// Macrame: `render_camera` in two halves over a frame the caller keeps. `cull_camera` is the
+	// device-free half (camera, visibility, shadows, frustum, the lists of what to draw) and
+	// `draw_culled` the recording half; `render_camera` is the two in sequence over a scratch
+	// frame. A renderer that does not split returns nothing from `cull_frame_create`.
+	virtual RenderSceneCullFrame *cull_frame_create() { return nullptr; }
+	virtual void cull_frame_free(RenderSceneCullFrame *p_frame) {}
+	virtual void cull_camera(RenderSceneCullFrame *p_frame, const Ref<RenderSceneBuffers> &p_render_buffers, RID p_camera, RID p_scenario, RID p_viewport, Size2 p_viewport_size, uint32_t p_jitter_phase_count, float p_mesh_lod_threshold, RID p_shadow_atlas, Ref<XRInterface> &p_xr_interface, float p_window_output_max_value, RenderingServerTypes::RenderInfo *r_render_info = nullptr) {}
+	virtual void draw_culled(RenderSceneCullFrame *p_frame) {}
+	virtual bool cull_frame_matches(const RenderSceneCullFrame *p_frame, const Ref<RenderSceneBuffers> &p_render_buffers) const { return false; }
+	// The device-side part of `update()` (resource uploads, collider renders), for the node that
+	// holds the recording grant; `update()` itself skips it once `macrame_set_defer_device_update`.
+	virtual void macrame_set_defer_device_update(bool p_defer) {}
+	virtual bool macrame_device_update_deferred() const { return false; }
+	virtual void macrame_device_update() {}
 
 	virtual void update() = 0;
 	virtual void render_probes() = 0;

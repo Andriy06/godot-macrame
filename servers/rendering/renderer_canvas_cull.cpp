@@ -2563,7 +2563,9 @@ void RendererCanvasCull::update_dirty_items() {
 	}
 
 	// Instance updates may affect resources.
-	RSG::utilities->update_dirty_resources();
+	if (!RSG::scene->macrame_device_update_deferred()) {
+		RSG::utilities->update_dirty_resources(); // Otherwise the record node uploads (`macrame_device_update`).
+	}
 }
 
 void RendererCanvasCull::_update_dirty_item(Item *p_item) {

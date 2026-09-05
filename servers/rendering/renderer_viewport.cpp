@@ -30,6 +30,8 @@
 
 #include "renderer_viewport.h"
 
+#include "core/macrame/macrame_phase_probe.h"
+#include "core/macrame/macrame_render_lists.h"
 #include "core/macrame/macrame_render_outputs.h"
 
 #include "core/config/engine.h"
@@ -341,6 +343,17 @@ void RendererViewport::_draw_3d(Viewport *p_viewport) {
 	}
 
 	float screen_mesh_lod_threshold = p_viewport->mesh_lod_threshold / float(p_viewport->size.width);
+#ifdef MACRAME_ENABLED
+	if (record_lists) {
+		RenderSceneCullFrame *frame = record_lists->find(p_viewport->self);
+		if (frame && RSG::scene->cull_frame_matches(frame, p_viewport->render_buffers)) {
+			RSG::scene->draw_culled(frame);
+			RENDER_TIMESTAMP("< Render 3D Scene");
+			return;
+		}
+		macrame_cull_fallbacks++;
+	}
+#endif
 	RSG::scene->render_camera(p_viewport->render_buffers, p_viewport->camera, p_viewport->scenario, p_viewport->self, p_viewport->internal_size, p_viewport->jitter_phase_count, screen_mesh_lod_threshold, p_viewport->shadow_atlas, xr_interface, p_viewport->window_output_max_value, &p_viewport->render_info);
 
 	RENDER_TIMESTAMP("< Render 3D Scene");
@@ -792,6 +805,79 @@ DisplayServerEnums::WindowID RendererViewport::_get_containing_window(Viewport *
 
 	return DisplayServerEnums::INVALID_WINDOW_ID;
 }
+
+#ifdef MACRAME_ENABLED
+void RendererViewport::macrame_cull_viewports(MacrameRenderLists &r_lists) {
+	GodotProfileZone("cull viewports");
+	r_lists.entries.clear();
+	if (sorted_active_viewports_dirty) {
+		sorted_active_viewports = _sort_active_viewports();
+		sorted_active_viewports_dirty = false;
+	}
+	// The same visibility rules as `draw_viewports`, without its side effects (`last_pass`,
+	// `draw_viewports_pass`): a parent's visibility is read from the last draw.
+	uint32_t used = 0;
+	for (int i = 0; i < sorted_active_viewports.size(); i++) {
+		Viewport *vp = sorted_active_viewports[i];
+		if (vp->update_mode == RSE::VIEWPORT_UPDATE_DISABLED || !vp->render_target.is_valid()) {
+			continue;
+		}
+		bool visible = vp->viewport_to_screen_rect != Rect2();
+		if (vp->use_xr) {
+			continue; // XR viewports take the combined path.
+		}
+		if (vp->update_mode == RSE::VIEWPORT_UPDATE_ALWAYS || vp->update_mode == RSE::VIEWPORT_UPDATE_ONCE) {
+			visible = true;
+		}
+		if (vp->update_mode == RSE::VIEWPORT_UPDATE_WHEN_VISIBLE && RSG::texture_storage->render_target_was_used(vp->render_target)) {
+			visible = true;
+		}
+		if (vp->update_mode == RSE::VIEWPORT_UPDATE_WHEN_PARENT_VISIBLE) {
+			Viewport *parent = viewport_owner.get_or_null(vp->parent);
+			if (parent && parent->last_pass == draw_viewports_pass) {
+				visible = true;
+			}
+		}
+		visible = visible && vp->size.x > 1 && vp->size.y > 1 && vp->view_count > 0;
+		if (!visible) {
+			continue;
+		}
+		if (vp->disable_3d || !RSG::scene->is_camera(vp->camera) || !vp->render_buffers.is_valid()) {
+			continue; // No 3D, or the record node still has to create the buffers: combined path.
+		}
+		if (RSG::scene->is_scenario(vp->scenario)) {
+			RID environment = RSG::scene->scenario_get_environment(vp->scenario);
+			bool can_draw_2d = !vp->disable_2d && vp->view_count == 1;
+			if (RSG::scene->is_environment(environment) && can_draw_2d && !viewport_is_environment_disabled(vp) && RSG::scene->environment_get_background(environment) == RSE::ENV_BG_CANVAS) {
+				continue; // Canvas background: `_draw_viewport` draws no 3D for it.
+			}
+		}
+		RenderSceneCullFrame *frame = r_lists.acquire(RSG::scene, used);
+		if (!frame) {
+			return; // The scene renderer does not split.
+		}
+		used++;
+		if (vp->use_occlusion_culling && vp->occlusion_buffer_dirty) {
+			float aspect = vp->size.aspect();
+			int max_size = occlusion_rays_per_thread * WorkerThreadPool::get_singleton()->get_thread_count();
+			int viewport_size = vp->size.width * vp->size.height;
+			max_size = CLAMP(max_size, viewport_size / (32 * 32), viewport_size / (2 * 2));
+			float height = Math::sqrt(max_size / aspect);
+			Size2i new_size = Size2i(height * aspect, height);
+			RendererSceneOcclusionCull::get_singleton()->buffer_set_size(vp->self, new_size);
+			vp->occlusion_buffer_dirty = false;
+		}
+		float screen_mesh_lod_threshold = vp->mesh_lod_threshold / float(vp->size.width);
+		Ref<XRInterface> no_xr;
+		MACRAME_PHASE("cull: viewport select");
+		RSG::scene->cull_camera(frame, vp->render_buffers, vp->camera, vp->scenario, vp->self, vp->internal_size, vp->jitter_phase_count, screen_mesh_lod_threshold, vp->shadow_atlas, no_xr, vp->window_output_max_value, &vp->render_info);
+		MacrameRenderLists::Entry e;
+		e.viewport = vp->self;
+		e.frame = frame;
+		r_lists.entries.push_back(e);
+	}
+}
+#endif
 
 void RendererViewport::draw_viewports(bool p_swap_buffers) {
 	GodotProfileZoneGroupedFirst(_profile_zone, "prepare viewports");

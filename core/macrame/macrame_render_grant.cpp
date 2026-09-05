@@ -32,6 +32,7 @@
 
 #ifdef MACRAME_ENABLED
 #include "ts/access.h"
+#include "ts/scheduler.h"
 #endif
 
 #if defined(_MSC_VER) && !defined(__clang__)
@@ -42,6 +43,7 @@
 
 thread_local bool macrame_tls_holds_render_grant = false;
 thread_local bool macrame_tls_holds_render_device_grant = false;
+thread_local bool macrame_tls_holds_record_grant = false;
 thread_local bool macrame_tls_holds_physics_grant = false;
 
 MACRAME_NO_INLINE void MacramePhysics::set_holds_grant(bool p_holds) {
@@ -68,9 +70,26 @@ MACRAME_NO_INLINE void MacrameRenderDevice::set_holds_grant(bool p_holds) {
 	macrame_tls_holds_render_device_grant = p_holds;
 }
 
+MACRAME_NO_INLINE void MacrameRecord::set_holds_grant(bool p_holds) {
+	macrame_tls_holds_record_grant = p_holds;
+}
+
+MacrameRender::Inherited_grant_scope::Inherited_grant_scope() :
+		previous(holds_grant()), previous_record(MacrameRecord::holds_grant()) {
+	// A chunk inherits every grant of the body that launched it, so both mirrors follow.
+	set_holds_grant(true);
+	MacrameRecord::set_holds_grant(true);
+}
+
+MacrameRender::Inherited_grant_scope::~Inherited_grant_scope() {
+	set_holds_grant(previous);
+	MacrameRecord::set_holds_grant(previous_record);
+}
+
 namespace {
 bool (*render_access_query)() = nullptr;
 RenderGrantToken *render_token = nullptr;
+RecordGrantToken *record_token = nullptr;
 void (*device_access_check)(const void *) = nullptr;
 } // namespace
 
@@ -92,11 +111,41 @@ void MacrameRender::set_token(RenderGrantToken *p_token) {
 	render_token = p_token;
 }
 
+void MacrameRecord::set_token(RecordGrantToken *p_token) {
+	record_token = p_token;
+}
+
+bool MacrameRecord::check_access() {
+	if (macrame_tls_holds_record_grant) {
+		return true;
+	}
+	if (!record_token) {
+		return true; // Before the render server registers, and after it has gone: direct.
+	}
+#ifdef MACRAME_ENABLED
+	// Direct mode is a blue thread with nothing in flight - never a worker: the render server's
+	// query answers "yes" for the body holding the render grant too, and that body is exactly the
+	// one this check exists to refuse.
+	if (ts::current_worker_index() < 0 && render_access_query && render_access_query()) {
+		return true;
+	}
+	ts::access_check(record_token); // Fatal under TS_SAFETY_CHECKS unless the running task declared the grant.
+#else
+	if (render_access_query && render_access_query()) {
+		return true;
+	}
+#endif
+	return true;
+}
+
 bool MacrameRender::check_access() {
-	// The render grant only. The device task holds a grant on `RenderingDeviceSubmit` instead and
-	// is refused here, which is what makes the split visible to the harness rather than a matter
-	// of review.
-	if (macrame_tls_holds_render_grant) {
+	// The render grant or the recording grant. The device task holds a grant on
+	// `RenderingDeviceSubmit` instead and is refused here, which is what makes the split visible
+	// to the harness rather than a matter of review. The recording grant passes because the
+	// record node reaches the device through the same entry points (`buffer_update`, draw lists,
+	// resource creation) as the render server always did; what it may *not* do is write the
+	// scene, and that has no entry point to guard.
+	if (macrame_tls_holds_render_grant || macrame_tls_holds_record_grant) {
 		return true;
 	}
 	if (!render_access_query) {

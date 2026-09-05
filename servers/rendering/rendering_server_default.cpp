@@ -104,6 +104,7 @@ void RenderingServerDefault::_macrame_render_node() {
 	render_request = false;
 	const int slot = split_draw ? render_slot : -1;
 	MacrameRender::set_holds_grant(true);
+	MacrameRecord::set_holds_grant(true);
 	MacrameRuntime::long_task_begin();
 	MacramePhaseProbe::frame_begin(MacrameScene::frame_graph_kind());
 	command_queue.commit_previous_under_grant();
@@ -111,8 +112,58 @@ void RenderingServerDefault::_macrame_render_node() {
 	_draw(render_present, render_step, slot);
 	MacramePhaseProbe::frame_end();
 	MacrameRuntime::long_task_end();
+	MacrameRecord::set_holds_grant(false);
 	MacrameRender::set_holds_grant(false);
 	// Read by the blue thread at the next frame boundary, which is the only other reader.
+	last_render_slot = slot;
+}
+
+// The scene update node. Declared access: write on the render server. Applies the journal cut at
+// the last frame boundary and runs the CPU side of the scene update; records nothing.
+void RenderingServerDefault::_macrame_update_node() {
+	if (!render_request) {
+		return; // Start-up only; see `_macrame_render_node`.
+	}
+	MacrameRender::set_holds_grant(true);
+	MacrameRuntime::long_task_begin();
+	MacramePhaseProbe::frame_begin(MacrameScene::frame_graph_kind());
+	command_queue.commit_previous_under_grant();
+	MACRAME_PHASE("journal apply");
+	_draw_update(render_step);
+	MacrameRuntime::long_task_end();
+	MacrameRender::set_holds_grant(false);
+}
+
+// The cull node. Declared access: read on the render server, write on the lists. Culls every
+// visible 3D viewport into the lists; device-free, so it holds neither device grant and any
+// RenderingDevice call from here faults.
+void RenderingServerDefault::_macrame_cull_node(MacrameRenderLists &p_lists) {
+	if (!render_request) {
+		return;
+	}
+	MacrameRuntime::long_task_begin();
+	RSG::viewport->macrame_cull_viewports(p_lists);
+	MACRAME_PHASE("cull node");
+	MacrameRuntime::long_task_end();
+}
+
+// The record node. Declared access: read on the render server and the lists, write on the
+// recording grant. Everything that touches the device: the deferred uploads, skinning, the
+// passes, the stage into the hand-off ring.
+void RenderingServerDefault::_macrame_record_node(const MacrameRenderLists &p_lists) {
+	if (!render_request) {
+		return;
+	}
+	render_request = false;
+	const int slot = split_draw ? render_slot : -1;
+	MacrameRecord::set_holds_grant(true);
+	MacrameRuntime::long_task_begin();
+	RSG::viewport->macrame_set_record_lists(&p_lists);
+	_draw_record(render_present, render_step, slot);
+	RSG::viewport->macrame_set_record_lists(nullptr);
+	MacramePhaseProbe::frame_end();
+	MacrameRuntime::long_task_end();
+	MacrameRecord::set_holds_grant(false);
 	last_render_slot = slot;
 }
 
@@ -135,11 +186,23 @@ void RenderingServerDefault::_macrame_submit_node() {
 void RenderingServerDefault::_macrame_add_frame_nodes(void *p_graph) {
 	ts::Static_task_graph &graph = *static_cast<ts::Static_task_graph *>(p_graph);
 	RenderingServerDefault *rs = static_cast<RenderingServerDefault *>(RenderingServer::get_singleton());
-	// High priority on both: they are the frame's two longest single-threaded bodies, and at
+	// High priority on all of them: they are the frame's longest single-threaded bodies, and at
 	// equal priority a worker would pop a shard node ahead of them.
-	graph.add_node("render", [rs](RenderGrantToken &) { rs->_macrame_render_node(); },
-					rs->command_queue.get_guarded())
-			.set_priority(ts::Priority::high);
+	if (rs->split_render_nodes) {
+		graph.add_node("scene update", [rs](RenderGrantToken &) { rs->_macrame_update_node(); },
+						rs->command_queue.get_guarded())
+				.set_priority(ts::Priority::high);
+		graph.add_node("cull", [rs](const RenderGrantToken &, MacrameRenderLists &p_lists) { rs->_macrame_cull_node(p_lists); },
+						rs->command_queue.get_guarded(), rs->lists_guarded)
+				.set_priority(ts::Priority::high);
+		graph.add_node("record", [rs](const RenderGrantToken &, const MacrameRenderLists &p_lists, RecordGrantToken &) { rs->_macrame_record_node(p_lists); },
+						rs->command_queue.get_guarded(), rs->lists_guarded, rs->record_guarded)
+				.set_priority(ts::Priority::high);
+	} else {
+		graph.add_node("render", [rs](RenderGrantToken &, RecordGrantToken &) { rs->_macrame_render_node(); },
+						rs->command_queue.get_guarded(), rs->record_guarded)
+				.set_priority(ts::Priority::high);
+	}
 	if (rs->split_draw) {
 		graph.add_node("submit", [rs](RenderingDeviceSubmit &) { rs->_macrame_submit_node(); },
 						*rs->device_guarded)
@@ -178,16 +241,14 @@ void RenderingServerDefault::macrame_drain_commands() {
 }
 #endif
 
-void RenderingServerDefault::_draw(bool p_swap_buffers, double frame_step, int p_handoff_slot) {
+void RenderingServerDefault::_draw_update(double frame_step) {
 	GodotProfileZoneGroupedFirst(_profile_zone, "rasterizer->begin_frame");
 	RSG::rasterizer->begin_frame(frame_step);
 	MACRAME_PHASE("begin_frame");
 
-	TIMESTAMP_BEGIN()
 
 	uint64_t time_usec = OS::get_singleton()->get_ticks_usec();
 
-	RENDER_TIMESTAMP("Prepare Render Frame");
 
 #ifndef XR_DISABLED
 	GodotProfileZoneGrouped(_profile_zone, "xr_server->pre_render");
@@ -205,6 +266,20 @@ void RenderingServerDefault::_draw(bool p_swap_buffers, double frame_step, int p
 	MACRAME_PHASE("canvas update");
 
 	frame_setup_time = double(OS::get_singleton()->get_ticks_usec() - time_usec) / 1000.0;
+}
+
+void RenderingServerDefault::_draw_record(bool p_swap_buffers, double frame_step, int p_handoff_slot) {
+	GodotProfileZoneGroupedFirst(_profile_zone, "record: timestamps");
+	TIMESTAMP_BEGIN()
+
+	RENDER_TIMESTAMP("Prepare Render Frame");
+
+#ifndef XR_DISABLED
+	XRServer *xr_server = XRServer::get_singleton();
+#endif // XR_DISABLED
+	// The device side of the scene update: uploads, collider renders. Deferred here from
+	// `RSG::scene->update()` so the update node stays device-free.
+	RSG::scene->macrame_device_update();
 
 	GodotProfileZoneGrouped(_profile_zone, "particles_storage->update_particles");
 	RSG::particles_storage->update_particles(); //need to be done after instances are updated (colliders and particle transforms), and colliders are rendered
@@ -358,6 +433,11 @@ void RenderingServerDefault::_draw(bool p_swap_buffers, double frame_step, int p
 	RSG::utilities->update_memory_info();
 }
 
+void RenderingServerDefault::_draw(bool p_swap_buffers, double frame_step, int p_handoff_slot) {
+	_draw_update(frame_step);
+	_draw_record(p_swap_buffers, frame_step, p_handoff_slot);
+}
+
 void RenderingServerDefault::_run_post_draw_steps() {
 	while (frame_drawn_callbacks.front()) {
 		Callable c = frame_drawn_callbacks.front()->get();
@@ -409,10 +489,21 @@ void RenderingServerDefault::_init() {
 	device_guarded = RSG::rasterizer->get_device_guarded();
 	split_draw = device_guarded != nullptr && RSG::rasterizer->supports_split_submit() && OS::get_singleton()->get_environment("MACRAME_SPLIT_DRAW") != "0";
 	print_verbose(split_draw ? "Macrame: split draw enabled (render node + submit node)" : "Macrame: split draw disabled");
+	split_render_nodes = OS::get_singleton()->get_environment("MACRAME_RENDER_SPLIT") != "0";
+	print_verbose(split_render_nodes ? "Macrame: render pipeline as scene update + cull + record nodes" : "Macrame: single render node");
+	record_guarded.access([](RecordGrantToken &p_token) { MacrameRecord::set_token(&p_token); }).sync();
+	// The scene update never uploads: the node that holds the recording grant does, through
+	// `macrame_device_update()` at the head of `_draw_record`. True on every path, split or not.
+	RSG::scene->macrame_set_defer_device_update(true);
 #endif
 }
 
 void RenderingServerDefault::_finish() {
+#ifdef MACRAME_ENABLED
+	lists_guarded.access([](MacrameRenderLists &p_lists) { p_lists.release(RSG::scene); }).sync();
+	print_line(vformat("Macrame: 3D viewports drawn without a prepared cull (combined path): %d", RSG::viewport->macrame_get_cull_fallbacks()));
+	MacrameRecord::set_token(nullptr);
+#endif
 	if (test_cube.is_valid()) {
 		free_rid(test_cube);
 	}
@@ -665,7 +756,9 @@ void RenderingServerDefault::draw(bool p_present, double frame_step) {
 	command_queue.sync();
 	command_queue.get_guarded().access([&](RenderGrantToken &) {
 							 MacrameRender::set_holds_grant(true);
+							 MacrameRecord::set_holds_grant(true);
 							 _draw(p_present, frame_step, -1);
+							 MacrameRecord::set_holds_grant(false);
 							 MacrameRender::set_holds_grant(false);
 						 })
 			.sync();

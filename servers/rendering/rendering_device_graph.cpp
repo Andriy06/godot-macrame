@@ -324,7 +324,7 @@ int32_t RenderingDeviceGraph::_add_to_write_list(int32_t p_command_index, Rect2i
 #define GRAPH_ALIGN(x) (((x) + 7u) & 0xFFFFFFF8u)
 
 // The graph's harness hook. Whoever owns the graph right now must hold that side's grant:
-// the recording side the render grant, the submitting side the device grant. Both calls are
+// the recording side the recording grant, the submitting side the device grant. Both calls are
 // fatal (naming the object and the mode) when the grant is missing, and both fall through
 // silently before the guarded objects are registered, which is where the device is initialized.
 void RenderingDeviceGraph::_check_owner() {
@@ -341,7 +341,7 @@ void RenderingDeviceGraph::_check_owner() {
 			ts::access_check(this);
 			break;
 		default:
-			MacrameRender::check_access();
+			MacrameRecord::check_access();
 			break;
 	}
 #endif
@@ -357,7 +357,7 @@ void RenderingDeviceGraph::_check_reopen() {
 	if (graph_owner.load(std::memory_order_relaxed) == GRAPH_OWNER_SUBMIT) {
 		MacrameRenderDevice::check_access(graph_submit_owner);
 	} else {
-		MacrameRender::check_access();
+		MacrameRecord::check_access();
 	}
 	graph_owner.store(GRAPH_OWNER_RECORD, std::memory_order_relaxed);
 #endif
