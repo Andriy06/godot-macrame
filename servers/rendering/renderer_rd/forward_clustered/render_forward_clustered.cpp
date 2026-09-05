@@ -31,6 +31,7 @@
 #include "render_forward_clustered.h"
 
 #include "core/profiling/profiling.h"
+#include "core/macrame/macrame_phase_probe.h"
 #include "core/macrame/macrame_render_grant.h"
 #include "ts/parallel_for.h"
 
@@ -1066,6 +1067,9 @@ void RenderForwardClustered::_fill_render_list(RenderListType p_render_list, con
 
 	RenderList *rl = &render_list[p_render_list];
 	_update_dirty_geometry_instances();
+	if (p_render_list == RENDER_LIST_OPAQUE && !p_append) {
+		MACRAME_PHASE("rs: dirty geometry instances + pipelines");
+	}
 
 	if (!p_append) {
 		rl->clear();
@@ -1738,6 +1742,7 @@ void RenderForwardClustered::_pre_opaque_render(RenderDataRD *p_render_data, boo
 		}
 
 		_render_shadow_process();
+		MACRAME_PHASE("rs: shadow passes fill (lists + instance data)");
 	}
 
 	if (render_gi) {
@@ -1746,6 +1751,7 @@ void RenderForwardClustered::_pre_opaque_render(RenderDataRD *p_render_data, boo
 
 	if (render_shadows) {
 		_render_shadow_end();
+		MACRAME_PHASE("rs: shadow passes record");
 	}
 
 	if (rb_data.is_valid() && ss_effects) {
@@ -2048,15 +2054,18 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 	// May have changed due to the above (light buffer enlarged, as an example).
 	_update_render_base_uniform_set();
 
+	MACRAME_PHASE("rs: setup (env, lightmaps, base uniform set)");
 	_fill_render_list(RENDER_LIST_OPAQUE, p_render_data, PASS_MODE_COLOR, using_sdfgi, using_sdfgi || using_voxelgi, using_motion_pass);
 	render_list[RENDER_LIST_OPAQUE].sort_by_key();
 	render_list[RENDER_LIST_MOTION].sort_by_key();
 	render_list[RENDER_LIST_ALPHA].sort_by_reverse_depth_and_priority();
+	MACRAME_PHASE("rs: fill lists + sort");
 
 	int *render_info = p_render_data->render_info ? p_render_data->render_info->info[RSE::VIEWPORT_RENDER_INFO_TYPE_VISIBLE] : (int *)nullptr;
 	_fill_instance_data(RENDER_LIST_OPAQUE, render_info);
 	_fill_instance_data(RENDER_LIST_MOTION, render_info);
 	_fill_instance_data(RENDER_LIST_ALPHA, render_info);
+	MACRAME_PHASE("rs: instance data (UMA upload)");
 
 	RD::get_singleton()->draw_command_end_label();
 
@@ -2140,6 +2149,7 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 
 	// Update the compiled pipelines if any of the requirements have changed.
 	_update_dirty_geometry_pipelines();
+	MACRAME_PHASE("rs: global pipeline requirements");
 
 	RID radiance_texture;
 	bool draw_sky = false;
@@ -2317,7 +2327,9 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 			normal_roughness_views[v] = rb_data->get_normal_roughness(v);
 		}
 	}
+	MACRAME_PHASE("rs: sky setup + depth prepass record");
 	_pre_opaque_render(p_render_data, using_ssao, using_ssil, using_ssr, using_sdfgi || using_voxelgi, normal_roughness_views, rb_data.is_valid() && rb_data->has_voxelgi() ? rb_data->get_voxelgi() : RID());
+	MACRAME_PHASE("rs: pre-opaque (cluster, ss effects)");
 
 	if (current_cluster_builder) {
 		base_specialization.cluster_has_area_light = current_cluster_builder->get_cluster_count_by_type(ClusterBuilderRD::ELEMENT_TYPE_AREA_LIGHT) != 0;
@@ -2359,6 +2371,7 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 			RID opaque_framebuffer = using_motion_pass ? rb_data->get_color_pass_fb(opaque_color_pass_flags) : color_framebuffer;
 			RenderListParameters render_list_params(render_list[RENDER_LIST_OPAQUE].elements.ptr(), render_list[RENDER_LIST_OPAQUE].element_info.ptr(), render_list[RENDER_LIST_OPAQUE].elements.size(), reverse_cull, PASS_MODE_COLOR, opaque_color_pass_flags, rb_data.is_null(), p_render_data->directional_light_soft_shadows, rp_uniform_set, get_debug_draw_mode() == RSE::VIEWPORT_DEBUG_DRAW_WIREFRAME, Vector2(), p_render_data->scene_data->lod_distance_multiplier, p_render_data->scene_data->screen_mesh_lod_threshold, p_render_data->scene_data->view_count, 0, base_specialization, !is_reflection_probe);
 			_render_list_with_draw_list(&render_list_params, opaque_framebuffer, RD::DrawFlags(load_color ? RD::DRAW_DEFAULT_ALL : RD::DRAW_CLEAR_COLOR_ALL) | (depth_pre_pass ? RD::DRAW_DEFAULT_ALL : RD::DRAW_CLEAR_DEPTH), c, 0.0f, 0u, p_render_data->render_region);
+			MACRAME_PHASE("rs: opaque record");
 		}
 
 		RD::get_singleton()->draw_command_end_label();
@@ -2558,9 +2571,11 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 		// Motion vectors should not be overwritten by transparent objects.
 		transparent_color_pass_flags &= ~uint32_t(COLOR_PASS_FLAG_MOTION_VECTORS);
 
+		MACRAME_PHASE("rs: motion, sky, resolve, sss");
 		RID alpha_framebuffer = rb_data.is_valid() ? rb_data->get_color_pass_fb(transparent_color_pass_flags) : color_only_framebuffer;
 		RenderListParameters render_list_params(render_list[RENDER_LIST_ALPHA].elements.ptr(), render_list[RENDER_LIST_ALPHA].element_info.ptr(), render_list[RENDER_LIST_ALPHA].elements.size(), reverse_cull, PASS_MODE_COLOR, transparent_color_pass_flags, rb_data.is_null(), p_render_data->directional_light_soft_shadows, rp_uniform_set, get_debug_draw_mode() == RSE::VIEWPORT_DEBUG_DRAW_WIREFRAME, Vector2(), p_render_data->scene_data->lod_distance_multiplier, p_render_data->scene_data->screen_mesh_lod_threshold, p_render_data->scene_data->view_count, 0, base_specialization, !is_reflection_probe);
 		_render_list_with_draw_list(&render_list_params, alpha_framebuffer, RD::DRAW_DEFAULT_ALL, Vector<Color>(), 0.0f, 0u, p_render_data->render_region);
+		MACRAME_PHASE("rs: alpha record");
 	}
 
 	RD::get_singleton()->draw_command_end_label();
@@ -2704,6 +2719,7 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 			sdfgi->debug_draw(p_render_data->scene_data->view_count, p_render_data->scene_data->view_projection, p_render_data->scene_data->cam_transform, size.x, size.y, rb->get_render_target(), source_texture, view_rids);
 		}
 	}
+	MACRAME_PHASE("rs: post (tonemap, fx, debug)");
 }
 
 void RenderForwardClustered::_render_buffers_debug_draw(const RenderDataRD *p_render_data) {

@@ -110,6 +110,7 @@ struct FrameGraph {
 	bool written = false;
 	const char *dot_name = nullptr;
 	const char *svg_name = nullptr;
+	int kind = 3; // 0 plain_frame, 1 tick_frame, 2 tick_only (MacrameScene::frame_graph_kind).
 	std::string tick_names[MacrameScene::SHARD_COUNT]; // `ts::Named` keeps the pointer: stable storage.
 	std::string frame_names[MacrameScene::SHARD_COUNT];
 };
@@ -141,6 +142,7 @@ struct State {
 State *state = nullptr;
 MacrameScene::FrameNodeAdder render_node_adder = nullptr;
 bool graph_running = false;
+int graph_kind = 3;
 void _write_phase_trace(PhaseGraph &pg);
 void _write_frame_trace(FrameGraph &fg);
 namespace {
@@ -192,6 +194,9 @@ void MacrameScene::init() {
 	Graphs &g = *state->graphs;
 	g.tick_frame.with_tick = true;
 	g.tick_frame.with_frame = true;
+	g.tick_frame.kind = 1;
+	g.plain_frame.kind = 0;
+	g.tick_only.kind = 2;
 	g.tick_frame.dot_name = "macrame_tick_frame.dot";
 	g.tick_frame.svg_name = "macrame_tick_frame_avg.svg";
 	g.plain_frame.with_frame = true;
@@ -489,7 +494,9 @@ void _frame_run(FrameGraph &fg, SceneTree *p_tree) {
 		_build_frame_graph(fg, MacramePhysics::get_guarded());
 	}
 	fs.tree = p_tree;
+	graph_kind = fg.kind;
 	fg.graph.execute().sync();
+	graph_kind = 3;
 	// Both sides, unconditionally: a phase that captured a batch and then quit the iteration
 	// (`physics_process` returning true) must not leave it for the next run's graph.
 	for (auto &b : fs.tick_buckets) {
@@ -524,6 +531,10 @@ void MacrameScene::frame_set_capturing(bool p_capturing) {
 
 void MacrameScene::set_frame_render_nodes(FrameNodeAdder p_adder) {
 	render_node_adder = p_adder;
+}
+
+int MacrameScene::frame_graph_kind() {
+	return graph_kind;
 }
 
 bool MacrameScene::frame_graph_running() {
@@ -575,6 +586,7 @@ void MacrameScene::run_groups(SceneTree *, void **, int, bool) {}
 bool MacrameScene::frame_graph_enabled() { return false; }
 void MacrameScene::set_frame_render_nodes(FrameNodeAdder) {}
 bool MacrameScene::frame_graph_running() { return false; }
+int MacrameScene::frame_graph_kind() { return 3; }
 void MacrameScene::frame_set_graph_running(bool) {}
 void MacrameScene::frame_set_capturing(bool) {}
 void MacrameScene::frame_set_tick(double) {}

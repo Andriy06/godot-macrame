@@ -125,4 +125,7 @@ void set_frame_render_nodes(FrameNodeAdder p_adder);
 // boot-time draws before the first iteration are. Not the same as `frame_graph_enabled()`.
 bool frame_graph_running();
 void frame_set_graph_running(bool p_running);
+// Which graph the current run belongs to: 0 plain_frame, 1 tick_frame, 2 tick_only, 3 none. Set by
+// the blue thread before `execute()`, read by node bodies (the render phase probe).
+int frame_graph_kind();
 } // namespace MacrameScene

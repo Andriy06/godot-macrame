@@ -1,0 +1,151 @@
+/**************************************************************************/
+/*  macrame_phase_probe.cpp                                               */
+/**************************************************************************/
+/*                         This file is part of:                          */
+/*                             GODOT ENGINE                               */
+/*                        https://godotengine.org                         */
+/**************************************************************************/
+/* Copyright (c) 2014-present Godot Engine contributors (see AUTHORS.md). */
+/* Copyright (c) 2007-2014 Juan Linietsky, Ariel Manzur.                  */
+/*                                                                        */
+/* Permission is hereby granted, free of charge, to any person obtaining  */
+/* a copy of this software and associated documentation files (the        */
+/* "Software"), to deal in the Software without restriction, including    */
+/* without limitation the rights to use, copy, modify, merge, publish,    */
+/* distribute, sublicense, and/or sell copies of the Software, and to     */
+/* permit persons to whom the Software is furnished to do so, subject to  */
+/* the following conditions:                                              */
+/*                                                                        */
+/* The above copyright notice and this permission notice shall be         */
+/* included in all copies or substantial portions of the Software.        */
+/*                                                                        */
+/* THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,        */
+/* EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF     */
+/* MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. */
+/* IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY   */
+/* CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,   */
+/* TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE      */
+/* SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.                 */
+/**************************************************************************/
+
+#include "macrame_phase_probe.h"
+
+#ifdef MACRAME_ENABLED
+
+#include "core/os/os.h"
+#include "core/string/print_string.h"
+#include "core/string/ustring.h"
+
+#include <cstring>
+
+namespace {
+
+constexpr int MAX_PHASES = 64;
+constexpr int KINDS = 4;
+constexpr const char *KIND_NAMES[KINDS] = { "plain_frame", "tick_frame", "tick_only", "sync" };
+
+struct Phase {
+	const char *name = nullptr;
+	double sum_us = 0.0;
+	double max_us = 0.0;
+	uint64_t n = 0;
+};
+
+struct KindStats {
+	Phase phases[MAX_PHASES];
+	int phase_count = 0;
+	uint64_t frames = 0;
+	double total_sum_us = 0.0;
+	double total_max_us = 0.0;
+};
+
+KindStats stats[KINDS];
+bool active = false;
+int cur_kind = 0;
+uint64_t frame_start_us = 0;
+uint64_t last_mark_us = 0;
+
+bool _enabled() {
+	static const bool e = OS::get_singleton()->get_environment("MACRAME_RENDER_PHASES") == "1";
+	return e;
+}
+
+void _report(int p_kind) {
+	KindStats &k = stats[p_kind];
+	if (k.frames == 0) {
+		return;
+	}
+	String out = vformat("MACRAME_PHASES kind=%s frames=%d total_mean_us=%.0f total_max_us=%.0f\n", KIND_NAMES[p_kind], (int64_t)k.frames, k.total_sum_us / k.frames, k.total_max_us);
+	for (int i = 0; i < k.phase_count; i++) {
+		const Phase &p = k.phases[i];
+		out += vformat("  %-36s mean_us=%8.1f  max_us=%8.0f  per_frame_calls=%.2f\n", p.name, p.sum_us / k.frames, p.max_us, double(p.n) / k.frames);
+	}
+	print_line(out);
+}
+
+} // namespace
+
+bool MacramePhaseProbe::enabled() {
+	return _enabled();
+}
+
+void MacramePhaseProbe::frame_begin(int p_kind) {
+	if (!_enabled()) {
+		return;
+	}
+	active = true;
+	cur_kind = (p_kind >= 0 && p_kind < KINDS) ? p_kind : KINDS - 1;
+	frame_start_us = OS::get_singleton()->get_ticks_usec();
+	last_mark_us = frame_start_us;
+}
+
+void MacramePhaseProbe::mark(const char *p_name) {
+	if (!active) {
+		return;
+	}
+	const uint64_t now = OS::get_singleton()->get_ticks_usec();
+	const double dt = double(now - last_mark_us);
+	last_mark_us = now;
+	KindStats &k = stats[cur_kind];
+	Phase *p = nullptr;
+	for (int i = 0; i < k.phase_count; i++) {
+		// Names are string literals: the pointer identifies the phase; strcmp is the fallback for
+		// two translation units spelling the same literal.
+		if (k.phases[i].name == p_name || strcmp(k.phases[i].name, p_name) == 0) {
+			p = &k.phases[i];
+			break;
+		}
+	}
+	if (!p) {
+		if (k.phase_count == MAX_PHASES) {
+			return;
+		}
+		p = &k.phases[k.phase_count++];
+		p->name = p_name;
+	}
+	p->sum_us += dt;
+	p->n++;
+	if (dt > p->max_us) {
+		p->max_us = dt;
+	}
+}
+
+void MacramePhaseProbe::frame_end() {
+	if (!active) {
+		return;
+	}
+	mark("(tail)");
+	active = false;
+	KindStats &k = stats[cur_kind];
+	const double total = double(OS::get_singleton()->get_ticks_usec() - frame_start_us);
+	k.frames++;
+	k.total_sum_us += total;
+	if (total > k.total_max_us) {
+		k.total_max_us = total;
+	}
+	if (k.frames % 1000 == 0) {
+		_report(cur_kind);
+	}
+}
+
+#endif // MACRAME_ENABLED

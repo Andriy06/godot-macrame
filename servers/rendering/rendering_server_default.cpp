@@ -30,6 +30,7 @@
 
 #include "rendering_server_default.h"
 
+#include "core/macrame/macrame_phase_probe.h"
 #include "core/macrame/macrame_runtime.h"
 #include "core/macrame/macrame_scene.h"
 
@@ -104,8 +105,11 @@ void RenderingServerDefault::_macrame_render_node() {
 	const int slot = split_draw ? render_slot : -1;
 	MacrameRender::set_holds_grant(true);
 	MacrameRuntime::long_task_begin();
+	MacramePhaseProbe::frame_begin(MacrameScene::frame_graph_kind());
 	command_queue.commit_previous_under_grant();
+	MACRAME_PHASE("journal apply");
 	_draw(render_present, render_step, slot);
+	MacramePhaseProbe::frame_end();
 	MacrameRuntime::long_task_end();
 	MacrameRender::set_holds_grant(false);
 	// Read by the blue thread at the next frame boundary, which is the only other reader.
@@ -177,6 +181,7 @@ void RenderingServerDefault::macrame_drain_commands() {
 void RenderingServerDefault::_draw(bool p_swap_buffers, double frame_step, int p_handoff_slot) {
 	GodotProfileZoneGroupedFirst(_profile_zone, "rasterizer->begin_frame");
 	RSG::rasterizer->begin_frame(frame_step);
+	MACRAME_PHASE("begin_frame");
 
 	TIMESTAMP_BEGIN()
 
@@ -197,20 +202,25 @@ void RenderingServerDefault::_draw(bool p_swap_buffers, double frame_step, int p
 	RSG::scene->update(); //update scenes stuff before updating instances
 	GodotProfileZoneGrouped(_profile_zone, "canvas->update");
 	RSG::canvas->update();
+	MACRAME_PHASE("canvas update");
 
 	frame_setup_time = double(OS::get_singleton()->get_ticks_usec() - time_usec) / 1000.0;
 
 	GodotProfileZoneGrouped(_profile_zone, "particles_storage->update_particles");
 	RSG::particles_storage->update_particles(); //need to be done after instances are updated (colliders and particle transforms), and colliders are rendered
+	MACRAME_PHASE("particles update");
 
 	GodotProfileZoneGrouped(_profile_zone, "scene->render_probes");
 	RSG::scene->render_probes();
+	MACRAME_PHASE("render probes");
 
 	GodotProfileZoneGrouped(_profile_zone, "viewport->draw_viewports");
 	RSG::viewport->draw_viewports(p_swap_buffers);
+	MACRAME_PHASE("draw_viewports: tail (blit, 2D)");
 
 	GodotProfileZoneGrouped(_profile_zone, "canvas_render->update");
 	RSG::canvas_render->update();
+	MACRAME_PHASE("canvas_render update");
 
 	GodotProfileZoneGrouped(_profile_zone, "rasterizer->end_frame");
 #ifdef MACRAME_ENABLED
@@ -230,6 +240,7 @@ void RenderingServerDefault::_draw(bool p_swap_buffers, double frame_step, int p
 	RSG::rasterizer->end_frame(p_swap_buffers);
 #endif
 
+	MACRAME_PHASE("stage submit (advance frame)");
 #ifndef XR_DISABLED
 	if (xr_server != nullptr) {
 		GodotProfileZone("xr_server->end_frame");
@@ -241,6 +252,7 @@ void RenderingServerDefault::_draw(bool p_swap_buffers, double frame_step, int p
 	GodotProfileZoneGrouped(_profile_zone, "update_visibility_notifiers");
 	RSG::canvas->update_visibility_notifiers();
 	RSG::scene->update_visibility_notifiers();
+	MACRAME_PHASE("visibility notifiers");
 
 #ifdef MACRAME_ENABLED
 	{
@@ -252,6 +264,7 @@ void RenderingServerDefault::_draw(bool p_swap_buffers, double frame_step, int p
 		RSG::viewport->macrame_collect_outputs(outputs);
 		RSG::particles_storage->macrame_collect_inactive(outputs.inactive_particles);
 		MacrameRenderSnapshot::stage(std::move(outputs));
+		MACRAME_PHASE("stage outputs");
 	}
 #endif
 	GodotProfileZoneGrouped(_profile_zone, "post_draw_steps");

@@ -32,6 +32,7 @@
 
 #include "core/config/engine.h"
 #include "core/config/project_settings.h"
+#include "core/macrame/macrame_phase_probe.h"
 #include "core/profiling/profiling.h" // [perf-zones]
 #include "core/math/geometry_3d.h"
 #include "core/object/callable_mp.h"
@@ -2786,6 +2787,7 @@ void RendererSceneCull::render_camera(const Ref<RenderSceneBuffers> &p_render_bu
 	RENDER_TIMESTAMP("Update Occlusion Buffer")
 	// For now just cull on the first camera
 	RendererSceneOcclusionCull::get_singleton()->buffer_update(p_viewport, camera_data.main_transform, camera_data.main_projection, camera_data.is_orthogonal);
+	MACRAME_PHASE("viewport + camera setup");
 
 	_render_scene(&camera_data, p_render_buffers, environment, camera->attributes, compositor, camera->visible_layers, p_scenario, p_viewport, p_shadow_atlas, RID(), -1, p_screen_mesh_lod_threshold, p_window_output_max_value, true, r_render_info);
 #endif
@@ -3351,6 +3353,7 @@ void RendererSceneCull::_render_scene(const RendererSceneRender::CameraData *p_c
 		}
 	}
 
+	MACRAME_PHASE("rc: visibility cull");
 	RENDER_TIMESTAMP("Cull 3D Scene");
 
 	//rasterizer->set_camera(p_camera_data->main_transform, p_camera_data.main_projection, p_camera_data.is_orthogonal);
@@ -3396,6 +3399,7 @@ void RendererSceneCull::_render_scene(const RendererSceneRender::CameraData *p_c
 		}
 	}
 
+	MACRAME_PHASE("rc: directional shadow setup");
 	{ //sdfgi
 		cull.sdfgi.region_count = 0;
 
@@ -3469,6 +3473,7 @@ void RendererSceneCull::_render_scene(const RendererSceneRender::CameraData *p_c
 		print_line("time taken: " + rtos(time_avg / time_count));
 #endif
 
+		MACRAME_PHASE("rc: frustum cull");
 		if (scene_cull_result.mesh_instances.size()) {
 			for (uint64_t i = 0; i < scene_cull_result.mesh_instances.size(); i++) {
 				RSG::mesh_storage->mesh_instance_check_for_update(scene_cull_result.mesh_instances[i]);
@@ -3477,6 +3482,7 @@ void RendererSceneCull::_render_scene(const RendererSceneRender::CameraData *p_c
 		}
 	}
 
+	MACRAME_PHASE("rc: mesh instances (skinning dispatch)");
 	//render shadows
 
 	max_shadows_used = 0;
@@ -3652,6 +3658,7 @@ void RendererSceneCull::_render_scene(const RendererSceneRender::CameraData *p_c
 		}
 	}
 
+	MACRAME_PHASE("rc: positional shadows");
 	//render SDFGI
 
 	{
@@ -3715,6 +3722,7 @@ void RendererSceneCull::_render_scene(const RendererSceneRender::CameraData *p_c
 	scene_render->render_scene(p_render_buffers, p_camera_data, prev_camera_data, scene_cull_result.geometry_instances, scene_cull_result.light_instances, scene_cull_result.reflections, scene_cull_result.voxel_gi_instances, scene_cull_result.decals, scene_cull_result.lightmaps, scene_cull_result.fog_volumes, p_environment, camera_attributes, p_compositor, p_shadow_atlas, occluders_tex, p_reflection_probe.is_valid() ? RID() : scenario->reflection_atlas, p_reflection_probe, p_reflection_probe_pass, p_screen_mesh_lod_threshold, render_shadow_data, max_shadows_used, render_sdfgi_data, cull.sdfgi.region_count, p_window_output_max_value, &sdfgi_update_data, r_render_info);
 
 	if (p_viewport.is_valid()) {
+		MACRAME_PHASE("rc: render_scene tail");
 		RSG::viewport->viewport_set_prev_camera_data(p_viewport, p_camera_data);
 	}
 
@@ -4368,8 +4376,10 @@ void RendererSceneCull::update_dirty_instances() const {
 		_update_dirty_instance(_instance_update_list.first()->self());
 	}
 
+	MACRAME_PHASE("su: dirty instances");
 	// Update dirty resources after dirty instances as instance updates may affect resources.
 	RSG::utilities->update_dirty_resources();
+	MACRAME_PHASE("su: dirty resources (uploads)");
 }
 
 void RendererSceneCull::update() {
@@ -4383,9 +4393,12 @@ void RendererSceneCull::update() {
 		s->indexers[Scenario::INDEXER_GEOMETRY].optimize_incremental(indexer_update_iterations);
 		s->indexers[Scenario::INDEXER_VOLUMES].optimize_incremental(indexer_update_iterations);
 	}
+	MACRAME_PHASE("su: indexer optimize");
 	scene_render->update();
+	MACRAME_PHASE("su: sky + pipeline requirements");
 	update_dirty_instances();
 	render_particle_colliders();
+	MACRAME_PHASE("su: particle colliders");
 }
 
 bool RendererSceneCull::free(RID p_rid) {
