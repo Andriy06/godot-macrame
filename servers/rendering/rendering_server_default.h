@@ -37,6 +37,7 @@
 #include "core/macrame/macrame_command_queue.h"
 #include "core/macrame/macrame_render_grant.h"
 #include "core/macrame/macrame_render_lists.h"
+#include "ts/versioned.h"
 #include "core/macrame/macrame_render_outputs.h"
 #include "servers/rendering/rendering_device_submit.h"
 #endif
@@ -145,9 +146,31 @@ class RenderingServerDefault : public RenderingServer {
 	// MACRAME_RENDER_SPLIT=0 keeps the single `render` node for A/B.
 	bool split_render_nodes = false;
 	ts::Guarded<RecordGrantToken> record_guarded{ ts::Named{ "render_record" } };
-	ts::Guarded<MacrameRenderLists> lists_guarded{ ts::Named{ "render_lists" } };
+	ts::Guarded<MacrameRenderLists> lists_guarded{ ts::Named{ "render_lists" } }; // The same-run shape (MACRAME_RENDER_LAG=0).
 	void *single_run_data = nullptr; // The single-node / synchronous draw's own run hand-off.
 
+	// The versioned shape (results 2.16, step 2): the lists are a `ts::Versioned` value the
+	// record node reads one run after the cull node produced them, so the two overlap with no
+	// edge between them. The frames themselves live in three cull sets owned by frame parity -
+	// the set the cull fills, the set the record reads, one just released - and the published
+	// value only names the set's frames. Ownership is the blue thread's: it names the set the
+	// next cull fills at the frame boundary and moves the states along; a node touching a set
+	// in the wrong state faults deterministically (`CRASH_COND`), from frame one.
+	bool lists_lagged = false;
+	ts::Versioned<MacrameRenderLists> lists_versioned{ ts::Named{ "render_lists_versioned" }, ts::Resync::overwrite };
+	ts::Recorder<MacrameRenderLists> lists_recorder = lists_versioned.recorder();
+	static constexpr int CULL_SETS = 3;
+	struct CullSet {
+		MacrameRenderLists lists;
+		enum State { FREE, CULLING, PUBLISHED } state = FREE;
+	};
+	CullSet cull_sets[CULL_SETS];
+	int cull_set = -1; // The set the next run's cull fills; set by the blue thread with the frame post.
+	int front_set = -1; // The set the record node reads this run (published at the last boundary).
+	uint64_t post_frame_number = 0; // The frame number posted with `render_request`.
+	bool lists_staged = false; // Written by the cull node, read by the blue thread at the boundary.
+	void _macrame_cull_node_lagged();
+	void _macrame_record_node_lagged(const MacrameRenderLists &p_front);
 	void _macrame_update_node();
 	void _macrame_cull_node(MacrameRenderLists &p_lists);
 	void _macrame_record_node(const MacrameRenderLists &p_lists);

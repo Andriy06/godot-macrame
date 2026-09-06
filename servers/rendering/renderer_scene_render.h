@@ -394,6 +394,7 @@ public:
 	virtual void run_data_free(void *p_run_data) {}
 	virtual void collect_run_data(void *p_run_data) {}
 	virtual void apply_run_data(void *p_run_data) {}
+	virtual void macrame_run_boundary() {}
 	// Macrame: the record node's per-frame resource uploads (the skeleton ring slot of the frame).
 	virtual void macrame_upload_frame_resources(uint64_t p_frame) {}
 	// Macrame: the blue thread posted frame `p_frame`; the next scene update writes its slots.

@@ -182,6 +182,74 @@ void RenderingServerDefault::_macrame_record_node(const MacrameRenderLists &p_li
 	last_render_slot = slot;
 }
 
+// The cull node, versioned shape. Declared access: read on the render server. Fills the cull set
+// the blue thread named for this run and stages the published copy; the record node of the next
+// run reads it.
+void RenderingServerDefault::_macrame_cull_node_lagged() {
+	lists_staged = false;
+	if (!render_request) {
+		return;
+	}
+	render_request = false; // Consumed here: the scene update node ran first (the derived edge).
+	CRASH_COND_MSG(cull_set < 0 || cull_set >= CULL_SETS, "Macrame: the cull node has no set.");
+	CullSet &set = cull_sets[cull_set];
+	CRASH_COND_MSG(set.state != CullSet::FREE, "Macrame: the cull node's set is still owned by a recorded frame.");
+	set.state = CullSet::CULLING;
+	MacrameRuntime::long_task_begin();
+	MacramePhaseProbe::lane_begin(MacrameScene::frame_graph_kind(), "cull node");
+	set.lists.frame_number = post_frame_number;
+	set.lists.present = render_present;
+	set.lists.step = render_step;
+	set.lists.render_slot = split_draw ? render_slot : -1;
+	set.lists.set_index = cull_set;
+	set.lists.valid = true;
+	RSG::viewport->macrame_cull_viewports(set.lists);
+	if (!set.lists.run_data) {
+		set.lists.run_data = RSG::scene->macrame_run_data_create();
+		set.lists.owns_run_data = true;
+	}
+	if (set.lists.run_data) {
+		RSG::scene->macrame_collect_run_data(set.lists.run_data);
+	}
+	MACRAME_PHASE("cull: run data");
+	// Staged, not published: the blue thread publishes at the frame boundary, once this run is
+	// joined, so the record node of the next run sees exactly this frame.
+	lists_recorder.stage([copy = set.lists.published_copy()](MacrameRenderLists &p_front) {
+		p_front = copy;
+	});
+	lists_staged = true;
+	MacramePhaseProbe::lane_end();
+	MacrameRuntime::long_task_end();
+}
+
+// The record node, versioned shape. Declared access: read on the versioned front, write on the
+// recording grant - and nothing on the render server, which is what lets it overlap the scene
+// update of the next frame. What it reads of the scene is what the cull copied into the frame,
+// the surface caches the update node only ever creates (never rebuilds in place: frees are
+// deferred through the run value), and the skeleton slot of its own frame.
+void RenderingServerDefault::_macrame_record_node_lagged(const MacrameRenderLists &p_front) {
+	if (!p_front.valid) {
+		return;
+	}
+	CRASH_COND_MSG(p_front.set_index < 0 || p_front.set_index >= CULL_SETS, "Macrame: the published lists name no set.");
+	CRASH_COND_MSG(cull_sets[p_front.set_index].state != CullSet::PUBLISHED, "Macrame: the record node's set was not published for it.");
+	const int slot = p_front.render_slot;
+	MacrameRecord::set_holds_grant(true);
+	MacrameRuntime::long_task_begin();
+	MacramePhaseProbe::lane_begin(MacrameScene::frame_graph_kind(), "record node");
+	if (p_front.run_data) {
+		RSG::scene->macrame_apply_run_data(p_front.run_data);
+	}
+	MACRAME_PHASE("record: run data (compile lists, deferred frees)");
+	RSG::viewport->macrame_set_record_lists(&p_front);
+	_draw_record(p_front.present, p_front.step, slot);
+	RSG::viewport->macrame_set_record_lists(nullptr);
+	MacramePhaseProbe::lane_end();
+	MacrameRuntime::long_task_end();
+	MacrameRecord::set_holds_grant(false);
+	last_render_slot = slot;
+}
+
 // The submit node. Declared access: write on `Guarded<RenderingDeviceSubmit>` (the device
 // payload). It does one thing: take the value the previous run's render node staged and submit it
 // - compile the graph, hand it to the queue, present.
@@ -206,7 +274,17 @@ void RenderingServerDefault::_macrame_add_frame_nodes(void *p_graph) {
 	RenderingServerDefault *rs = static_cast<RenderingServerDefault *>(RenderingServer::get_singleton());
 	// High priority on all of them: they are the frame's longest single-threaded bodies, and at
 	// equal priority a worker would pop a shard node ahead of them.
-	if (rs->split_render_nodes) {
+	if (rs->split_render_nodes && rs->lists_lagged) {
+		graph.add_node("scene update", [rs](RenderGrantToken &) { rs->_macrame_update_node(); },
+						rs->command_queue.get_guarded())
+				.set_priority(ts::Priority::high);
+		graph.add_node("cull", [rs](const RenderGrantToken &) { rs->_macrame_cull_node_lagged(); },
+						rs->command_queue.get_guarded())
+				.set_priority(ts::Priority::high);
+		graph.add_node("record", [rs](const MacrameRenderLists &p_front, RecordGrantToken &) { rs->_macrame_record_node_lagged(p_front); },
+						rs->lists_versioned.state(), rs->record_guarded)
+				.set_priority(ts::Priority::high);
+	} else if (rs->split_render_nodes) {
 		graph.add_node("scene update", [rs](RenderGrantToken &) { rs->_macrame_update_node(); },
 						rs->command_queue.get_guarded())
 				.set_priority(ts::Priority::high);
@@ -515,7 +593,8 @@ void RenderingServerDefault::_init() {
 	split_draw = device_guarded != nullptr && RSG::rasterizer->supports_split_submit() && OS::get_singleton()->get_environment("MACRAME_SPLIT_DRAW") != "0";
 	print_verbose(split_draw ? "Macrame: split draw enabled (render node + submit node)" : "Macrame: split draw disabled");
 	split_render_nodes = OS::get_singleton()->get_environment("MACRAME_RENDER_SPLIT") != "0";
-	print_verbose(split_render_nodes ? "Macrame: render pipeline as scene update + cull + record nodes" : "Macrame: single render node");
+	lists_lagged = split_render_nodes && OS::get_singleton()->get_environment("MACRAME_RENDER_LAG") != "0";
+	print_verbose(split_render_nodes ? (lists_lagged ? "Macrame: render pipeline as scene update + cull + record nodes, record one run behind (versioned lists)" : "Macrame: render pipeline as scene update + cull + record nodes, same run") : "Macrame: single render node");
 	record_guarded.access([](RecordGrantToken &p_token) { MacrameRecord::set_token(&p_token); }).sync();
 	// The scene update never uploads: the node that holds the recording grant does, through
 	// `macrame_device_update()` at the head of `_draw_record`. True on every path, split or not.
@@ -526,6 +605,10 @@ void RenderingServerDefault::_init() {
 void RenderingServerDefault::_finish() {
 #ifdef MACRAME_ENABLED
 	lists_guarded.access([](MacrameRenderLists &p_lists) { p_lists.release(RSG::scene); }).sync();
+	lists_versioned.discard(); // A staged frame nobody will record.
+	for (int i = 0; i < CULL_SETS; i++) {
+		cull_sets[i].lists.release(RSG::scene);
+	}
 	if (single_run_data) {
 		RSG::scene->macrame_run_data_free(single_run_data);
 		single_run_data = nullptr;
@@ -770,6 +853,26 @@ void RenderingServerDefault::draw(bool p_present, double frame_step) {
 		submit_slot = last_render_slot;
 		last_render_slot = -1;
 
+		// 2b. The lists (versioned shape): what the cull node staged this run becomes the version
+		//     the next run's record node reads; the set that record node just finished with is
+		//     free again. Nothing staged means nothing to record next run: the front is
+		//     invalidated so the same frame is never recorded twice.
+		if (lists_lagged) {
+			if (!lists_staged) {
+				lists_recorder.stage([](MacrameRenderLists &p_front) { p_front.valid = false; });
+			}
+			lists_versioned.publish().sync(); // A blue thread; the run is joined.
+			if (front_set >= 0) {
+				cull_sets[front_set].state = CullSet::FREE;
+				front_set = -1;
+			}
+			if (lists_staged) {
+				cull_sets[cull_set].state = CullSet::PUBLISHED;
+				front_set = cull_set;
+			}
+			lists_staged = false;
+		}
+
 		// 3. Cut the command journal: everything staged up to this point - by this run's shards
 		//    and by the blue thread since the last cut - becomes the batch the next run's render
 		//    node applies under the grant. New commands stage into the other journal.
@@ -779,6 +882,12 @@ void RenderingServerDefault::draw(bool p_present, double frame_step) {
 		render_present = p_present;
 		render_step = frame_step;
 		render_slot = int(draw_seq % HANDOFF_SLOTS);
+		post_frame_number = draw_seq;
+		cull_set = int(draw_seq % CULL_SETS); // The parity set the next cull fills: FREE by construction (checked there).
+		if (lists_lagged) {
+			RSG::scene->macrame_frame_posted(draw_seq); // The skeleton slot the next scene update writes.
+			RSG::scene->macrame_run_boundary(); // The deferred-notification parity flips.
+		}
 		draw_seq++;
 		render_request = true;
 		return;

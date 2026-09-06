@@ -817,10 +817,23 @@ private:
 		LocalVector<GeometryInstanceSurfaceDataCache *> new_surfaces;
 		LocalVector<GeometryInstanceSurfaceDataCache *> surface_frees;
 		LocalVector<GeometryInstanceForwardClustered *> instance_frees;
+		// Instances whose transforms uniform set (multimesh, particles, skeleton) the record node
+		// (re)creates: a device object, so not the update node's to make.
+		LocalVector<GeometryInstanceForwardClustered *> transforms_refresh;
 	};
 	LocalVector<GeometryInstanceSurfaceDataCache *> pending_new_surfaces;
 	LocalVector<GeometryInstanceSurfaceDataCache *> pending_surface_frees;
 	LocalVector<GeometryInstanceForwardClustered *> pending_instance_frees;
+	LocalVector<GeometryInstanceForwardClustered *> pending_transforms_refresh;
+	// New surfaces whose material had no uniform set when the update node built them: the record
+	// node's resource update creates it; the set is read into the cache before the draw.
+	LocalVector<GeometryInstanceSurfaceDataCache *> surfaces_awaiting_material_set;
+	void _geometry_instance_transforms_uniform_set(GeometryInstanceForwardClustered *ginstance);
+	void _geometry_instance_transforms_uniform_set_now(GeometryInstanceForwardClustered *ginstance);
+	// Dirty marks that reach the record node (a material's uniform layout changed on upload) are
+	// deferred to the next update, by run parity; see RendererSceneCull::deferred_instance_updates.
+	LocalVector<GeometryInstanceForwardClustered *> deferred_dirty_marks[2];
+	int deferred_write = 0;
 	bool defer_frees = true; // Off from the destructor on: nothing is in flight, free at once.
 	void _defer_surface_free(GeometryInstanceSurfaceDataCache *p_surface) {
 		if (!defer_frees) {
@@ -952,6 +965,7 @@ public:
 	virtual void run_data_free(void *p_run_data) override;
 	virtual void collect_run_data(void *p_run_data) override;
 	virtual void apply_run_data(void *p_run_data) override;
+	virtual void macrame_run_boundary() override { deferred_write ^= 1; }
 
 	RenderForwardClustered();
 	~RenderForwardClustered();

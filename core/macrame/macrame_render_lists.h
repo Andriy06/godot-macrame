@@ -52,8 +52,30 @@ struct MacrameRenderLists {
 	LocalVector<Entry> entries; // The frames culled this run.
 	LocalVector<RenderSceneCullFrame *> pool; // Every frame this value owns; `entries` point into it.
 	void *run_data = nullptr; // The renderer's update -> record hand-off of the run (opaque).
-	bool owns_run_data = false; // The value that created its run data frees it.
+	bool owns_run_data = false; // A cull set owns its run data; a published copy only names it.
 	uint64_t frame_number = 0;
+	// What the blue thread posted with the frame, carried to the record node with the lists.
+	bool present = false;
+	double step = 0.0;
+	int render_slot = -1; // The device hand-off slot of the frame.
+	int set_index = -1; // The cull set the entries live in.
+	bool valid = false; // A frame is here to record.
+
+	// The published copy: names the set's frames and run data, owns nothing.
+	MacrameRenderLists published_copy() const {
+		MacrameRenderLists c;
+		c.entries = entries;
+		c.run_data = run_data;
+		c.owns_run_data = false;
+		c.frame_number = frame_number;
+		c.present = present;
+		c.step = step;
+		c.render_slot = render_slot;
+		c.set_index = set_index;
+		c.valid = valid;
+		return c;
+	}
+
 	RenderSceneCullFrame *find(RID p_viewport) const {
 		for (const Entry &e : entries) {
 			if (e.viewport == p_viewport) {

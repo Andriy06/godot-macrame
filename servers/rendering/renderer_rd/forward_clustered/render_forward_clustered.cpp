@@ -308,8 +308,9 @@ bool RenderForwardClustered::free(RID p_rid) {
 
 void RenderForwardClustered::update() {
 	RendererSceneRenderRD::update();
-	_update_global_pipeline_data_requirements_from_project();
-	_update_global_pipeline_data_requirements_from_light_storage();
+	// The global pipeline requirements are the record node's: it discovers the rest of the bits
+	// while rendering, in the same word, so the project / light-storage refresh happens at the
+	// head of its frame (`_render_prepared_scene`), not here in the scene update.
 }
 
 /// RENDERING ///
@@ -1869,8 +1870,18 @@ void RenderForwardClustered::_process_sss(Ref<RenderSceneBuffersRD> p_render_buf
 }
 
 void RenderForwardClustered::_render_prepared_scene(FrameRenderData *p_fd, RenderDataRD *p_render_data, const Color &p_default_bg_color) {
+	if (surfaces_awaiting_material_set.size()) {
+		// The material's uniform set exists now (the resource update ran at the head of this
+		// record); a material without uniforms keeps a null set, as in stock Godot.
+		for (GeometryInstanceSurfaceDataCache *sc : surfaces_awaiting_material_set) {
+			sc->material_uniform_set = sc->material->uniform_set;
+		}
+		surfaces_awaiting_material_set.clear();
+	}
 	RenderFrameLists &l = *static_cast<RenderFrameLists *>(p_fd);
 	scene_state.used_uniform_buffer_count = 0;
+	_update_global_pipeline_data_requirements_from_project();
+	_update_global_pipeline_data_requirements_from_light_storage();
 
 	RendererRD::LightStorage *light_storage = RendererRD::LightStorage::get_singleton();
 
@@ -4468,7 +4479,20 @@ uint32_t RenderForwardClustered::sdfgi_get_pending_region_cascade(const Ref<Rend
 }
 
 void RenderForwardClustered::GeometryInstanceForwardClustered::_mark_dirty() {
-	if (pending_free || dirty_list_element.in_list()) {
+	if (pending_free) {
+		return;
+	}
+#ifdef MACRAME_ENABLED
+	if (MacrameRecord::holds_grant() && !MacrameRender::holds_grant()) {
+		// The record node: the dirty list is the update node's, membership included (a mark
+		// dropped because the update was rebuilding this instance right then was lost for
+		// good). Deferred to the next update.
+		RenderForwardClustered *rfc = RenderForwardClustered::get_singleton();
+		rfc->deferred_dirty_marks[rfc->deferred_write].push_back(this);
+		return;
+	}
+#endif
+	if (dirty_list_element.in_list()) {
 		return;
 	}
 
@@ -4695,6 +4719,37 @@ void RenderForwardClustered::_geometry_instance_add_surface(GeometryInstanceForw
 	}
 }
 
+void RenderForwardClustered::_geometry_instance_transforms_uniform_set(GeometryInstanceForwardClustered *ginstance) {
+#ifdef MACRAME_ENABLED
+	if (!MacrameRecord::holds_grant()) {
+		// The update node (or the blue thread's sync path): the record node applies it with the
+		// run data, before it draws. Found by the harness: the particles' "update once now"
+		// opened a compute list from the update node.
+		pending_transforms_refresh.push_back(ginstance);
+		return;
+	}
+#endif
+	_geometry_instance_transforms_uniform_set_now(ginstance);
+}
+
+void RenderForwardClustered::_geometry_instance_transforms_uniform_set_now(GeometryInstanceForwardClustered *ginstance) {
+	RendererRD::MeshStorage *mesh_storage = RendererRD::MeshStorage::get_singleton();
+	RendererRD::ParticlesStorage *particles_storage = RendererRD::ParticlesStorage::get_singleton();
+	if (ginstance->data->base_type == RSE::INSTANCE_MULTIMESH) {
+		ginstance->transforms_uniform_set = mesh_storage->multimesh_get_3d_uniform_set(ginstance->data->base, scene_shader.default_shader_rd, TRANSFORMS_UNIFORM_SET);
+	} else if (ginstance->data->base_type == RSE::INSTANCE_PARTICLES) {
+		if (particles_storage->particles_get_frame_counter(ginstance->data->base) == 0) {
+			// Particles haven't been cleared or updated, update once now to ensure they are ready to render.
+			particles_storage->update_particles();
+		}
+		ginstance->transforms_uniform_set = particles_storage->particles_get_instance_buffer_uniform_set(ginstance->data->base, scene_shader.default_shader_rd, TRANSFORMS_UNIFORM_SET);
+	} else if (ginstance->data->base_type == RSE::INSTANCE_MESH && mesh_storage->skeleton_is_valid(ginstance->data->skeleton)) {
+		ginstance->transforms_uniform_set = mesh_storage->skeleton_get_3d_uniform_set(ginstance->data->skeleton, scene_shader.default_shader_rd, TRANSFORMS_UNIFORM_SET);
+	} else {
+		ginstance->transforms_uniform_set = RID();
+	}
+}
+
 void RenderForwardClustered::_geometry_instance_update(RenderGeometryInstance *p_geometry_instance) {
 	RendererRD::MeshStorage *mesh_storage = RendererRD::MeshStorage::get_singleton();
 	RendererRD::ParticlesStorage *particles_storage = RendererRD::ParticlesStorage::get_singleton();
@@ -4802,8 +4857,6 @@ void RenderForwardClustered::_geometry_instance_update(RenderGeometryInstance *p
 			ginstance->base_flags |= INSTANCE_DATA_FLAG_MULTIMESH_INDIRECT;
 		}
 
-		ginstance->transforms_uniform_set = mesh_storage->multimesh_get_3d_uniform_set(ginstance->data->base, scene_shader.default_shader_rd, TRANSFORMS_UNIFORM_SET);
-
 	} else if (ginstance->data->base_type == RSE::INSTANCE_PARTICLES) {
 		ginstance->base_flags |= INSTANCE_DATA_FLAG_PARTICLES;
 		ginstance->base_flags |= INSTANCE_DATA_FLAG_MULTIMESH;
@@ -4817,26 +4870,19 @@ void RenderForwardClustered::_geometry_instance_update(RenderGeometryInstance *p
 		if (!particles_storage->particles_is_using_local_coords(ginstance->data->base)) {
 			store_transform = false;
 		}
-		if (particles_storage->particles_get_frame_counter(ginstance->data->base) == 0) {
-			// Particles haven't been cleared or updated, update once now to ensure they are ready to render.
-			particles_storage->update_particles();
-		}
-
-		ginstance->transforms_uniform_set = particles_storage->particles_get_instance_buffer_uniform_set(ginstance->data->base, scene_shader.default_shader_rd, TRANSFORMS_UNIFORM_SET);
-
 		if (ginstance->data->dirty_dependencies) {
 			particles_storage->particles_update_dependency(ginstance->data->base, &ginstance->data->dependency_tracker);
 		}
 	} else if (ginstance->data->base_type == RSE::INSTANCE_MESH) {
 		if (mesh_storage->skeleton_is_valid(ginstance->data->skeleton)) {
-			ginstance->transforms_uniform_set = mesh_storage->skeleton_get_3d_uniform_set(ginstance->data->skeleton, scene_shader.default_shader_rd, TRANSFORMS_UNIFORM_SET);
 			if (ginstance->data->dirty_dependencies) {
 				mesh_storage->skeleton_update_dependency(ginstance->data->skeleton, &ginstance->data->dependency_tracker);
 			}
-		} else {
-			ginstance->transforms_uniform_set = RID();
 		}
 	}
+	// The transforms uniform set: a device object (multimesh, particles, skeleton), made where
+	// the recording grant is.
+	_geometry_instance_transforms_uniform_set(ginstance);
 
 	ginstance->store_transform_cache = store_transform;
 	ginstance->can_sdfgi = false;
@@ -5335,7 +5381,15 @@ void RenderForwardClustered::geometry_instance_free(RenderGeometryInstance *p_ge
 
 void RenderForwardClustered::update_geometry_instances() {
 	// The update node's half: rebuild the surface caches of every dirty geometry instance.
-	// Pipelines are the record node's (`_update_dirty_geometry_pipelines` there).
+	// Pipelines are the record node's (`_update_dirty_geometry_pipelines` there). First the
+	// marks the record node deferred last run.
+	LocalVector<GeometryInstanceForwardClustered *> &deferred = deferred_dirty_marks[deferred_write ^ 1];
+	for (GeometryInstanceForwardClustered *gi : deferred) {
+		if (!gi->pending_free) {
+			gi->_mark_dirty();
+		}
+	}
+	deferred.clear();
 	while (geometry_instance_dirty_list.first()) {
 		_geometry_instance_update(geometry_instance_dirty_list.first()->self());
 	}
@@ -5371,6 +5425,10 @@ void RenderForwardClustered::collect_run_data(void *p_run_data) {
 	for (GeometryInstanceForwardClustered *gi : pending_instance_frees) {
 		r->instance_frees.push_back(gi);
 	}
+	for (GeometryInstanceForwardClustered *gi : pending_transforms_refresh) {
+		r->transforms_refresh.push_back(gi);
+	}
+	pending_transforms_refresh.clear();
 	pending_new_surfaces.clear();
 	pending_surface_frees.clear();
 	pending_instance_frees.clear();
@@ -5388,8 +5446,12 @@ void RenderForwardClustered::apply_run_data(void *p_run_data) {
 		if (!sc->compilation_all_element.in_list()) {
 			geometry_surface_compilation_all_list.add(&sc->compilation_all_element);
 		}
+		if (sc->material_uniform_set.is_null() && sc->material) {
+			surfaces_awaiting_material_set.push_back(sc);
+		}
 	}
 	for (GeometryInstanceSurfaceDataCache *sc : r->surface_frees) {
+		surfaces_awaiting_material_set.erase(sc);
 		if (sc->compilation_dirty_element.in_list()) {
 			sc->compilation_dirty_element.remove_from_list();
 		}
@@ -5398,6 +5460,12 @@ void RenderForwardClustered::apply_run_data(void *p_run_data) {
 		}
 		geometry_instance_surface_alloc.free(sc);
 	}
+	for (GeometryInstanceForwardClustered *gi : r->transforms_refresh) {
+		if (!gi->pending_free) { // Freed instances are still allocated here (below), never drawn.
+			_geometry_instance_transforms_uniform_set_now(gi);
+		}
+	}
+	r->transforms_refresh.clear();
 	for (GeometryInstanceForwardClustered *gi : r->instance_frees) {
 		memdelete(gi->data);
 		geometry_instance_alloc.free(gi);

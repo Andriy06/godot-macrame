@@ -33,6 +33,7 @@
 #include "core/config/engine.h"
 #include "core/config/project_settings.h"
 #include "core/macrame/macrame_phase_probe.h"
+#include "core/macrame/macrame_render_grant.h"
 #include "core/profiling/profiling.h" // [perf-zones]
 #include "core/math/geometry_3d.h"
 #include "core/object/callable_mp.h"
@@ -528,6 +529,17 @@ void RendererSceneCull::scenario_add_viewport_visibility_mask(RID p_scenario, RI
 /* INSTANCING API */
 
 void RendererSceneCull::_instance_queue_update(Instance *p_instance, bool p_update_aabb, bool p_update_dependencies) const {
+#ifdef MACRAME_ENABLED
+	if (MacrameRecord::holds_grant() && !MacrameRender::holds_grant()) {
+		// The record node: not its list to touch (the update node drains it, possibly right now).
+		DeferredInstanceUpdate d;
+		d.instance = p_instance->self;
+		d.aabb = p_update_aabb;
+		d.dependencies = p_update_dependencies;
+		deferred_instance_updates[deferred_write].push_back(d);
+		return;
+	}
+#endif
 	if (p_update_aabb) {
 		p_instance->update_aabb = true;
 	}
@@ -2891,6 +2903,13 @@ void RendererSceneCull::_cull_frame_delete(RenderSceneCullFrame *p_frame) {
 	memdelete(p_frame);
 }
 
+void RendererSceneCull::macrame_run_boundary() {
+	deferred_write ^= 1;
+	if (scene_render) {
+		scene_render->macrame_run_boundary();
+	}
+}
+
 void RendererSceneCull::macrame_before_renderer_free() {
 	if (scratch_frame && scratch_frame->render_lists && scene_render) {
 		scene_render->frame_data_free(scratch_frame->render_lists);
@@ -3109,9 +3128,10 @@ void RendererSceneCull::_scene_cull(CullData &cull_data, InstanceCullResult &cul
 							//but if nothing is going on, don't do it.
 							keep = false;
 						} else {
-							cull_data.cull->lock.lock();
-							RSG::particles_storage->particles_request_process(idata.base_rid);
-							cull_data.cull->lock.unlock();
+							// Not `particles_request_process` here: the storage's update list belongs to the
+							// node that drains it (`update_particles`, under the recording grant), which in
+							// the lagged shape runs beside this cull. The frame carries the request.
+							cull_result.particles.push_back(idata.base_rid);
 
 							RS::get_singleton()->call_on_render_thread(callable_mp_static(&RendererSceneCull::_scene_particles_set_view_axis).bind(idata.base_rid, -cull_data.cam_transform.basis.get_column(2).normalized(), cull_data.cam_transform.basis.get_column(1).normalized()));
 							//particles visible? request redraw
@@ -3432,6 +3452,7 @@ void RendererSceneCull::_cull_scene(RenderSceneCullFrame &p_frame, const Rendere
 	}
 	p_frame.render_info = r_render_info ? &p_frame.info_storage : nullptr;
 	p_frame.mesh_instances_to_update.clear();
+	p_frame.particles_to_process.clear();
 	p_frame.directional_lights.clear();
 	p_frame.culled = false;
 	RendererSceneRender::RenderShadowData *render_shadow_data = p_frame.render_shadow_data;
@@ -3614,6 +3635,9 @@ void RendererSceneCull::_cull_scene(RenderSceneCullFrame &p_frame, const Rendere
 		MACRAME_PHASE("rc: frustum cull");
 		for (uint64_t i = 0; i < scene_cull_result.mesh_instances.size(); i++) {
 			p_frame.mesh_instances_to_update.push_back(scene_cull_result.mesh_instances[i]);
+		}
+		for (uint64_t i = 0; i < scene_cull_result.particles.size(); i++) {
+			p_frame.particles_to_process.push_back(scene_cull_result.particles[i]);
 		}
 	}
 
@@ -3876,6 +3900,20 @@ void RendererSceneCull::_cull_scene(RenderSceneCullFrame &p_frame, const Rendere
 }
 
 void RendererSceneCull::_draw_culled_scene(RenderSceneCullFrame &p_frame) {
+	// The frame's resource uploads (the skeleton slot of this frame) first: the skinning below
+	// reads them, and a skeleton written once (a pose set at spawn, never animated) is skinned
+	// once - with the upload after the dispatch it was skinned from a buffer never written and
+	// stayed invisible (found by the static screenshot of the lagged shape).
+	scene_render->macrame_upload_frame_resources(p_frame.frame_number);
+	MACRAME_PHASE("rc: frame resources (skeleton slot upload)");
+
+	// The visible particle systems of this frame join the storage's update list here, under the
+	// recording grant; the next record's `update_particles` processes them (vanilla is one frame
+	// late the same way: its cull requests after the update ran).
+	for (const RID &particles : p_frame.particles_to_process) {
+		RSG::particles_storage->particles_request_process(particles);
+	}
+
 	// Skinning and blend shapes for every visible skinned mesh: a compute dispatch, so it belongs
 	// to the node that holds the recording grant.
 	if (p_frame.mesh_instances_to_update.size()) {
@@ -3900,10 +3938,6 @@ void RendererSceneCull::_draw_culled_scene(RenderSceneCullFrame &p_frame) {
 			RSG::light_storage->light_instance_set_shadow_transform(sd.light, sd.projection, sd.transform, sd.zfar, sd.split, sd.pass, sd.shadow_texel_size, sd.bias_scale, sd.range_begin, sd.uv_scale);
 		}
 	}
-	// The frame's resource uploads (the skeleton slot of this frame), before skinning reads them.
-	scene_render->macrame_upload_frame_resources(p_frame.frame_number);
-	MACRAME_PHASE("rc: frame resources (skeleton slot upload)");
-
 	RENDER_TIMESTAMP("Render 3D Scene");
 	GodotProfileZone("scene_render->render_scene");
 	if (p_frame.render_lists) {
@@ -3923,6 +3957,7 @@ void RendererSceneCull::_draw_culled_scene(RenderSceneCullFrame &p_frame) {
 		p_frame.render_sdfgi_data[i].instances.clear();
 	}
 	p_frame.mesh_instances_to_update.clear();
+	p_frame.particles_to_process.clear();
 	p_frame.culled = false;
 }
 
@@ -4595,7 +4630,15 @@ void RendererSceneCull::update() {
 	MACRAME_PHASE("su: sky + pipeline requirements");
 	if (macrame_defer_device_update) {
 		// The record node calls `macrame_device_update()` for the uploads and the collider
-		// renders; here only the CPU side.
+		// renders; here only the CPU side. First what the record node deferred last run.
+		LocalVector<DeferredInstanceUpdate> &deferred = deferred_instance_updates[deferred_write ^ 1];
+		for (const DeferredInstanceUpdate &d : deferred) {
+			Instance *instance = instance_owner.get_or_null(d.instance);
+			if (instance) {
+				_instance_queue_update(instance, d.aabb, d.dependencies);
+			}
+		}
+		deferred.clear();
 		while (_instance_update_list.first()) {
 			_update_dirty_instance(_instance_update_list.first()->self());
 		}

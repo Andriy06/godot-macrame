@@ -887,6 +887,7 @@ public:
 		PagedArray<RID> decals;
 		PagedArray<RID> voxel_gi_instances;
 		PagedArray<RID> mesh_instances;
+		PagedArray<RID> particles; // Visible, active particle systems: the record node requests their processing.
 		PagedArray<RID> fog_volumes;
 
 		struct DirectionalShadow {
@@ -905,6 +906,7 @@ public:
 			decals.clear();
 			voxel_gi_instances.clear();
 			mesh_instances.clear();
+			particles.clear();
 			fog_volumes.clear();
 			for (int i = 0; i < RendererSceneRender::MAX_DIRECTIONAL_LIGHTS; i++) {
 				for (int j = 0; j < RendererSceneRender::MAX_DIRECTIONAL_LIGHT_CASCADES; j++) {
@@ -930,6 +932,7 @@ public:
 			decals.reset();
 			voxel_gi_instances.reset();
 			mesh_instances.reset();
+			particles.reset();
 			fog_volumes.reset();
 			for (int i = 0; i < RendererSceneRender::MAX_DIRECTIONAL_LIGHTS; i++) {
 				for (int j = 0; j < RendererSceneRender::MAX_DIRECTIONAL_LIGHT_CASCADES; j++) {
@@ -955,6 +958,7 @@ public:
 			decals.merge_unordered(p_cull_result.decals);
 			voxel_gi_instances.merge_unordered(p_cull_result.voxel_gi_instances);
 			mesh_instances.merge_unordered(p_cull_result.mesh_instances);
+			particles.merge_unordered(p_cull_result.particles);
 			fog_volumes.merge_unordered(p_cull_result.fog_volumes);
 
 			for (int i = 0; i < RendererSceneRender::MAX_DIRECTIONAL_LIGHTS; i++) {
@@ -981,6 +985,7 @@ public:
 			decals.set_page_pool(p_rid_pool);
 			voxel_gi_instances.set_page_pool(p_rid_pool);
 			mesh_instances.set_page_pool(p_rid_pool);
+			particles.set_page_pool(p_rid_pool);
 			fog_volumes.set_page_pool(p_rid_pool);
 			for (int i = 0; i < RendererSceneRender::MAX_DIRECTIONAL_LIGHTS; i++) {
 				for (int j = 0; j < RendererSceneRender::MAX_DIRECTIONAL_LIGHT_CASCADES; j++) {
@@ -1179,6 +1184,18 @@ public:
 	virtual void macrame_collect_run_data(void *p_run_data) override { scene_render->collect_run_data(p_run_data); }
 	virtual void macrame_apply_run_data(void *p_run_data) override { scene_render->apply_run_data(p_run_data); }
 	virtual void macrame_before_renderer_free() override;
+	virtual void macrame_run_boundary() override;
+	// Macrame: an instance update queued from the record node (a dependency notification fired
+	// by an upload, a particle system's AABB) is deferred to the next scene update: the record
+	// node writes one parity, the update node drains the other; the blue thread flips them at
+	// the boundary. By RID, so an instance freed in between is simply skipped.
+	struct DeferredInstanceUpdate {
+		RID instance;
+		bool aabb = false;
+		bool dependencies = false;
+	};
+	mutable LocalVector<DeferredInstanceUpdate> deferred_instance_updates[2];
+	int deferred_write = 0;
 	void update_dirty_instances() const;
 
 	void render_particle_colliders();
@@ -1477,6 +1494,7 @@ struct RenderSceneCullFrame {
 	RendererSceneRender::RenderSDFGIData render_sdfgi_data[RendererSceneCull::SDFGI_MAX_CASCADES * RendererSceneCull::SDFGI_MAX_REGIONS_PER_CASCADE];
 	RendererSceneRender::RenderSDFGIUpdateData sdfgi_update_data;
 	LocalVector<RID> mesh_instances_to_update; // Skinned meshes the draw must update before recording.
+	LocalVector<RID> particles_to_process; // Visible particle systems; the draw requests their processing (the storage's update list is the record node's).
 	LocalVector<RID> shadow_lights_visible; // Visible shadow-casting light instances: the draw marks them for the atlas.
 	int directional_shadow_count = 0;
 	// Scratch of the cull itself.

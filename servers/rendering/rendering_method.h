@@ -378,6 +378,9 @@ public:
 	virtual void macrame_apply_run_data(void *p_run_data) {}
 	// Shutdown: the scene renderer is about to go; release what it owns on this side.
 	virtual void macrame_before_renderer_free() {}
+	// The blue thread, at every frame boundary of the lagged shape: the run parity of the
+	// deferred notifications flips (what the record node deferred this run, the next update drains).
+	virtual void macrame_run_boundary() {}
 	virtual bool macrame_device_update_deferred() const { return false; }
 	virtual void macrame_device_update() {}
 

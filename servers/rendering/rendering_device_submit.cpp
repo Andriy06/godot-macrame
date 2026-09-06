@@ -30,6 +30,8 @@
 
 #include "rendering_device_submit.h"
 
+#include "core/macrame/macrame_phase_probe.h"
+
 #include "core/profiling/profiling.h"
 #include "servers/rendering/rendering_device.h"
 
@@ -136,6 +138,7 @@ void RenderingDeviceSubmit::_end_frame(Staged &p_staged) {
 
 	GodotProfileZoneGrouped(_profile_zone, "draw_graph->end");
 	p_staged.graph->end(p_staged.reorder_commands, p_staged.full_barriers, command_buffer, slot.command_buffer_pool);
+	MACRAME_PHASE("submit: graph compile");
 	GodotProfileZoneGrouped(_profile_zone, "driver->command_buffer_end");
 	driver->command_buffer_end(command_buffer);
 	GodotProfileZoneGrouped(_profile_zone, "driver->end_segment");
@@ -212,6 +215,7 @@ void RenderingDeviceSubmit::_execute_frame(Staged &p_staged) {
 	const bool present_swap_chain = frame_can_present && !separate_present_queue;
 
 	_execute_chained_cmds(p_staged, present_swap_chain, p_staged.fence, semaphore);
+	MACRAME_PHASE("submit: queue submit");
 
 	// Indicate the fence has been signaled so the next time the frame's contents need to be used,
 	// the CPU waits for the work to complete.
@@ -223,6 +227,7 @@ void RenderingDeviceSubmit::_execute_frame(Staged &p_staged) {
 		if (separate_present_queue) {
 			// Issue the presentation separately if the presentation queue is different from the main queue.
 			driver->command_queue_execute_and_present(present_queue, slots[p_staged.slot].semaphore, {}, {}, {}, p_staged.swap_chains_to_present);
+			MACRAME_PHASE("submit: present");
 		}
 	}
 

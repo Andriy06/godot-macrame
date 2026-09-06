@@ -35,6 +35,7 @@
 #include "core/config/project_settings.h"
 #include "core/io/dir_access.h"
 #include "core/io/file_access.h"
+#include "core/macrame/macrame_phase_probe.h"
 #include "core/macrame/macrame_render_grant.h"
 #include "core/object/class_db.h"
 #include "core/os/os.h"
@@ -8452,6 +8453,7 @@ void RenderingDevice::_begin_frame(bool p_presented) {
 	GodotProfileZoneGroupedFirst(_profile_zone, "_stall_for_frame");
 	// Before writing to this frame, wait for it to be finished.
 	_stall_for_frame(frame);
+	MACRAME_PHASE("rd: reopen: fence wait");
 
 	if (command_pool_reset_enabled) {
 		GodotProfileZoneGrouped(_profile_zone, "driver->command_pool_reset");
@@ -8628,6 +8630,7 @@ void RenderingDevice::_flush_and_stall_for_all_frames(bool p_begin_frame) {
 		_begin_frame();
 	} else {
 		_stall_for_frame(frame);
+	MACRAME_PHASE("rd: reopen: fence wait");
 	}
 }
 
