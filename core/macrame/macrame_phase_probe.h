@@ -48,6 +48,9 @@ public:
 	static void lane_begin(int p_kind, const char *p_total_name);
 	static void mark(const char *p_name); // The end of phase `p_name`.
 	static void lane_end();
+	// The node body running on the calling worker ("record node", "scene update node", ...), or
+	// where the caller is instead. Kept whether or not the probe is enabled, for error messages.
+	static const char *current_lane_name();
 	// The single-node shape: one lane for the whole frame.
 	static void frame_begin(int p_kind) { lane_begin(p_kind, "render node"); }
 	static void frame_end() { lane_end(); }

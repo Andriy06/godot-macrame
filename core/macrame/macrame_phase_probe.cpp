@@ -74,10 +74,20 @@ struct Lane {
 	const char *total_name = nullptr;
 };
 Lane lanes[MAX_LANES];
+// The name of the node body running on each worker, kept whether or not the probe is enabled:
+// error messages from the device name the node they came from.
+const char *lane_names[MAX_LANES] = {};
 
 Lane *_lane() {
 	const int w = ts::current_worker_index() + 1;
 	return (w >= 0 && w < MAX_LANES) ? &lanes[w] : nullptr;
+}
+
+void _set_lane_name(const char *p_name) {
+	const int w = ts::current_worker_index() + 1;
+	if (w >= 0 && w < MAX_LANES) {
+		lane_names[w] = p_name;
+	}
 }
 
 bool _enabled() {
@@ -104,7 +114,14 @@ bool MacramePhaseProbe::enabled() {
 	return _enabled();
 }
 
+const char *MacramePhaseProbe::current_lane_name() {
+	const int w = ts::current_worker_index() + 1;
+	const char *n = (w >= 0 && w < MAX_LANES) ? lane_names[w] : nullptr;
+	return n ? n : (w == 0 ? "blue thread" : "worker, outside a render node");
+}
+
 void MacramePhaseProbe::lane_begin(int p_kind, const char *p_total_name) {
+	_set_lane_name(p_total_name);
 	if (!_enabled()) {
 		return;
 	}
@@ -160,6 +177,7 @@ static void _charge(KindStats &k, const char *p_name, double dt) {
 }
 
 void MacramePhaseProbe::lane_end() {
+	_set_lane_name(nullptr);
 	if (!_enabled()) {
 		return;
 	}

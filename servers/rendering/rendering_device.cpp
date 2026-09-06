@@ -5930,7 +5930,7 @@ void RenderingDevice::draw_list_bind_uniform_set(DrawListID p_list, RID p_unifor
 	ERR_FAIL_COND(!draw_list.active);
 
 	const UniformSet *uniform_set = uniform_set_owner.get_or_null(p_uniform_set);
-	ERR_FAIL_NULL(uniform_set);
+	ERR_FAIL_NULL_MSG(uniform_set, _macrame_null_set_message("draw_list_bind_uniform_set", p_index, p_uniform_set));
 
 	if (p_index > draw_list.state.set_count) {
 		draw_list.state.set_count = p_index;
@@ -6246,7 +6246,7 @@ void RenderingDevice::draw_list_draw(DrawListID p_list, bool p_use_indices, uint
 				}
 
 				UniformSet *uniform_set = uniform_set_owner.get_or_null(draw_list.state.sets[i].uniform_set);
-				ERR_FAIL_NULL(uniform_set);
+				ERR_FAIL_NULL_MSG(uniform_set, _macrame_null_set_message("draw_list_draw (a bound set)", i, draw_list.state.sets[i].uniform_set));
 				if (recorder == 0) {
 					_uniform_set_update_shared(uniform_set);
 					_uniform_set_update_clears(uniform_set);
@@ -6964,7 +6964,7 @@ void RenderingDevice::compute_list_bind_uniform_set(ComputeListID p_list, RID p_
 #endif
 
 	UniformSet *uniform_set = uniform_set_owner.get_or_null(p_uniform_set);
-	ERR_FAIL_NULL(uniform_set);
+	ERR_FAIL_NULL_MSG(uniform_set, _macrame_null_set_message("compute_list_bind_uniform_set", p_index, p_uniform_set));
 
 	if (p_index > compute_list.state.set_count) {
 		compute_list.state.set_count = p_index;
@@ -7815,6 +7815,17 @@ bool RenderingDevice::_dependencies_make_mutable(RID p_id, RDG::ResourceTracker 
 /**************************/
 /**** FRAME MANAGEMENT ****/
 /**************************/
+
+#ifdef MACRAME_ENABLED
+// A uniform set that is not there at bind time: a null RID is a set never created (the resource
+// update that creates it has not run), a non-null one is a set freed while still named (a
+// hand-off that outlived its owner). The message says which, and from which node.
+String RenderingDevice::_macrame_null_set_message(const char *p_where, uint32_t p_index, RID p_set) const {
+	return vformat("%s: uniform set %d is %s (from the %s, device frame %d).", p_where, (int64_t)p_index,
+			p_set.is_null() ? String("a null RID: never created") : vformat("RID %d, freed or invalid", (int64_t)p_set.get_id()),
+			MacramePhaseProbe::current_lane_name(), (int64_t)frames_drawn);
+}
+#endif
 
 void RenderingDevice::free_rid(RID p_rid) {
 	ERR_RENDER_THREAD_GUARD();

@@ -1983,6 +1983,9 @@ private:
 
 public:
 	void _free_internal(RID p_id);
+#ifdef MACRAME_ENABLED
+	String _macrame_null_set_message(const char *p_where, uint32_t p_index, RID p_set) const;
+#endif
 	void _check_no_open_lists();
 	void _begin_frame(bool p_presented = false);
 	void _advance_record_frame();

@@ -887,6 +887,21 @@ void WorkerThreadPool::exit_languages_threads() {
 
 void WorkerThreadPool::finish() {
 	if (threads.is_empty()) {
+#ifdef MACRAME_ENABLED
+		// No threads of its own (the group tasks fan out through Macrame): nothing to join, but
+		// what was never re-claimed still has to go, or the allocators report it at exit.
+		MutexLock lock(task_mutex);
+		for (KeyValue<TaskID, Task *> &E : tasks) {
+			print_verbose("WorkerThreadPool: task never re-claimed at exit: " + E.value->description);
+			task_allocator.free(E.value);
+		}
+		tasks.clear();
+		for (KeyValue<GroupID, Group *> &E : groups) {
+			print_verbose("WorkerThreadPool: group never re-claimed at exit.");
+			group_allocator.free(E.value);
+		}
+		groups.clear();
+#endif
 		return;
 	}
 
