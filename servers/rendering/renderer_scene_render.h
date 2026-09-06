@@ -284,6 +284,29 @@ public:
 		RID light;
 		int pass = 0;
 		PagedArray<RenderGeometryInstance *> instances;
+		// Macrame: the shadow camera the cull computed, carried to the draw instead of written into
+		// the light storage by the cull (`light_instance_set_shadow_transform` is the draw's).
+		bool has_transform = false;
+		Projection projection;
+		Transform3D transform;
+		float zfar = 0.0f;
+		float split = 0.0f;
+		float shadow_texel_size = 0.0f;
+		float bias_scale = 1.0f;
+		float range_begin = 0.0f;
+		Vector2 uv_scale;
+		void set_transform(const Projection &p_projection, const Transform3D &p_transform, float p_far, float p_split, int p_pass, float p_shadow_texel_size, float p_bias_scale = 1.0, float p_range_begin = 0, const Vector2 &p_uv_scale = Vector2()) {
+			has_transform = true;
+			projection = p_projection;
+			transform = p_transform;
+			zfar = p_far;
+			split = p_split;
+			pass = p_pass;
+			shadow_texel_size = p_shadow_texel_size;
+			bias_scale = p_bias_scale;
+			range_begin = p_range_begin;
+			uv_scale = p_uv_scale;
+		}
 	};
 
 	struct RenderSDFGIData {
@@ -354,5 +377,26 @@ public:
 	virtual void material_set_use_debanding(bool p_enable) = 0;
 
 	virtual void update() = 0;
+
+	// Macrame: `render_scene` in two halves over a frame the caller keeps. `frame_data_create`
+	// gives the renderer's per-frame lists; `prepare_scene` is the device-free half (the lists of
+	// what to draw, in the cull node), `render_prepared_scene` the recording half. A renderer that
+	// does not split returns false from `prepare_scene` and the caller draws with `render_scene`.
+	virtual void *frame_data_create() { return nullptr; }
+	virtual void frame_data_free(void *p_frame_data) {}
+	virtual bool prepare_scene(void *p_frame_data, const Ref<RenderSceneBuffers> &p_render_buffers, const CameraData *p_camera_data, const CameraData *p_prev_camera_data, const PagedArray<RenderGeometryInstance *> &p_instances, const PagedArray<RID> &p_lights, const PagedArray<RID> &p_reflection_probes, const PagedArray<RID> &p_voxel_gi_instances, const PagedArray<RID> &p_decals, const PagedArray<RID> &p_lightmaps, const PagedArray<RID> &p_fog_volumes, RID p_environment, RID p_camera_attributes, RID p_compositor, RID p_shadow_atlas, RID p_occluder_debug_tex, RID p_reflection_atlas, RID p_reflection_probe, int p_reflection_probe_pass, float p_screen_mesh_lod_threshold, const RenderShadowData *p_render_shadows, int p_render_shadow_count, const RenderSDFGIData *p_render_sdfgi_regions, int p_render_sdfgi_region_count, float p_window_output_max_value, const RenderSDFGIUpdateData *p_sdfgi_update_data = nullptr, RenderingServerTypes::RenderInfo *r_render_info = nullptr) { return false; }
+	virtual void render_prepared_scene(void *p_frame_data) {}
+	// Macrame: the scene update's half of the geometry bookkeeping (surface caches for dirty
+	// geometry instances), without device work; and the per-run hand-off of what it produced
+	// (new surfaces to compile, deferred frees) to the record node, through an opaque run value.
+	virtual void update_geometry_instances() {}
+	virtual void *run_data_create() { return nullptr; }
+	virtual void run_data_free(void *p_run_data) {}
+	virtual void collect_run_data(void *p_run_data) {}
+	virtual void apply_run_data(void *p_run_data) {}
+	// Macrame: the record node's per-frame resource uploads (the skeleton ring slot of the frame).
+	virtual void macrame_upload_frame_resources(uint64_t p_frame) {}
+	// Macrame: the blue thread posted frame `p_frame`; the next scene update writes its slots.
+	virtual void macrame_frame_posted(uint64_t p_frame) {}
 	virtual ~RendererSceneRender() {}
 };

@@ -327,11 +327,17 @@ private:
 	struct Skeleton {
 		bool use_2d = false;
 		int size = 0;
-		LocalVector<float> data;
+		// Macrame: the bone data as a ring of three slots. The scene update of frame N writes slot
+		// N % 3 (copy-on-first-write from the newest slot), the record of frame N uploads slot
+		// N % 3 two runs later, while the update of frame N+2 writes the third. Without the ring
+		// (the non-split draw) only slot 0 is ever used. `latest` is the slot the newest bones
+		// are in, for readers (bone getters, the skinned mesh AABB).
+		LocalVector<float> data[3];
+		bool dirty[3] = { false, false, false };
+		Skeleton *dirty_list[3] = { nullptr, nullptr, nullptr };
+		uint8_t latest = 0;
 		RID buffer;
 
-		bool dirty = false;
-		Skeleton *dirty_list = nullptr;
 		Transform2D base_transform_2d;
 
 		RID uniform_set_3d;
@@ -345,8 +351,12 @@ private:
 	mutable RID_Owner<Skeleton, true> skeleton_owner;
 
 	_FORCE_INLINE_ void _skeleton_make_dirty(Skeleton *skeleton);
+	// The write slot's data, after the copy-on-first-write; every bone setter goes through it.
+	_FORCE_INLINE_ float *_skeleton_write_data(Skeleton *skeleton);
 
-	Skeleton *skeleton_dirty_list = nullptr;
+	Skeleton *skeleton_dirty_list[3] = { nullptr, nullptr, nullptr };
+	int skeleton_write_slot = 0;
+	bool skeleton_ring = false;
 
 	enum AttributeLocation {
 		ATTRIBUTE_LOCATION_PREV_VERTEX = 12,
@@ -794,7 +804,13 @@ public:
 
 	virtual void skeleton_update_dependency(RID p_skeleton, DependencyTracker *p_instance) override;
 
-	void _update_dirty_skeletons();
+	void _update_dirty_skeletons(); // The write slot; the non-ring path.
+	// Macrame: the ring. The blue thread names the slot the next scene update writes; the record
+	// node uploads the slot of the frame it records.
+	void macrame_enable_skeleton_ring(bool p_enable) { skeleton_ring = p_enable; }
+	bool macrame_skeleton_ring_enabled() const { return skeleton_ring; }
+	void macrame_set_skeleton_write_slot(int p_slot) { skeleton_write_slot = p_slot % 3; }
+	void macrame_upload_skeletons(int p_slot);
 
 	_FORCE_INLINE_ bool skeleton_is_valid(RID p_skeleton) {
 		return skeleton_owner.get_or_null(p_skeleton) != nullptr;

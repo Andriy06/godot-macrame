@@ -1166,10 +1166,19 @@ public:
 	virtual void cull_frame_free(RenderSceneCullFrame *p_frame) override;
 	virtual void cull_camera(RenderSceneCullFrame *p_frame, const Ref<RenderSceneBuffers> &p_render_buffers, RID p_camera, RID p_scenario, RID p_viewport, Size2 p_viewport_size, uint32_t p_jitter_phase_count, float p_screen_mesh_lod_threshold, RID p_shadow_atlas, Ref<XRInterface> &p_xr_interface, float p_window_output_max_value, RenderingServerTypes::RenderInfo *r_render_info = nullptr) override;
 	virtual void draw_culled(RenderSceneCullFrame *p_frame) override;
+	virtual void cull_frame_set_number(RenderSceneCullFrame *p_frame, uint64_t p_frame_number) override;
+	virtual void cull_frame_copy_render_info(const RenderSceneCullFrame *p_frame, RenderingServerTypes::RenderInfo *r_render_info) override;
 	virtual bool cull_frame_matches(const RenderSceneCullFrame *p_frame, const Ref<RenderSceneBuffers> &p_render_buffers) const override;
 	virtual void macrame_set_defer_device_update(bool p_defer) override { macrame_defer_device_update = p_defer; }
 	virtual bool macrame_device_update_deferred() const override { return macrame_defer_device_update; }
 	virtual void macrame_device_update() override;
+	virtual void macrame_frame_posted(uint64_t p_frame) override { scene_render->macrame_frame_posted(p_frame); }
+	virtual void macrame_upload_frame_resources(uint64_t p_frame) override { scene_render->macrame_upload_frame_resources(p_frame); }
+	virtual void *macrame_run_data_create() override { return scene_render->run_data_create(); }
+	virtual void macrame_run_data_free(void *p_run_data) override { scene_render->run_data_free(p_run_data); }
+	virtual void macrame_collect_run_data(void *p_run_data) override { scene_render->collect_run_data(p_run_data); }
+	virtual void macrame_apply_run_data(void *p_run_data) override { scene_render->apply_run_data(p_run_data); }
+	virtual void macrame_before_renderer_free() override;
 	void update_dirty_instances() const;
 
 	void render_particle_colliders();
@@ -1454,8 +1463,10 @@ struct RenderSceneCullFrame {
 	float screen_mesh_lod_threshold = 0.0f;
 	float window_output_max_value = 1.0f;
 	bool using_shadows = true;
-	RenderingServerTypes::RenderInfo *render_info = nullptr;
+	RenderingServerTypes::RenderInfo *render_info = nullptr; // Points at `info_storage` once culled.
+	RenderingServerTypes::RenderInfo info_storage; // The frame's own counters; copied to the viewport by the draw.
 	uint64_t render_pass = 0;
+	uint64_t frame_number = 0; // The posted frame this cull belongs to (the skeleton slot is frame % 3).
 	// Outputs.
 	RendererSceneCull::InstanceCullResult cull_result;
 	LocalVector<RendererSceneCull::InstanceCullResult> cull_result_threads;
@@ -1466,8 +1477,11 @@ struct RenderSceneCullFrame {
 	RendererSceneRender::RenderSDFGIData render_sdfgi_data[RendererSceneCull::SDFGI_MAX_CASCADES * RendererSceneCull::SDFGI_MAX_REGIONS_PER_CASCADE];
 	RendererSceneRender::RenderSDFGIUpdateData sdfgi_update_data;
 	LocalVector<RID> mesh_instances_to_update; // Skinned meshes the draw must update before recording.
+	LocalVector<RID> shadow_lights_visible; // Visible shadow-casting light instances: the draw marks them for the atlas.
+	int directional_shadow_count = 0;
 	// Scratch of the cull itself.
 	PagedArray<RendererSceneCull::Instance *> shadow_cull_scratch;
 	RenderingLightCuller *light_culler = nullptr; // Owned by the frame.
+	void *render_lists = nullptr; // The scene renderer's per-frame lists (`frame_data_create`), owned by the frame.
 	bool culled = false; // Set by the cull, cleared by the draw.
 };

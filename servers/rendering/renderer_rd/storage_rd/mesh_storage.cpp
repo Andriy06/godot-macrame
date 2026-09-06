@@ -762,7 +762,7 @@ AABB MeshStorage::mesh_get_aabb(RID p_mesh, RID p_skeleton) {
 
 			int sbs = skeleton->size;
 			ERR_CONTINUE(bs > sbs);
-			const float *baseptr = skeleton->data.ptr();
+			const float *baseptr = skeleton->data[skeleton->latest].ptr();
 
 			bool found_bone_aabb = false;
 
@@ -2361,11 +2361,28 @@ void MeshStorage::skeleton_free(RID p_rid) {
 }
 
 void MeshStorage::_skeleton_make_dirty(Skeleton *skeleton) {
-	if (!skeleton->dirty) {
-		skeleton->dirty = true;
-		skeleton->dirty_list = skeleton_dirty_list;
-		skeleton_dirty_list = skeleton;
+	const int w = skeleton_write_slot;
+	if (!skeleton->dirty[w]) {
+		skeleton->dirty[w] = true;
+		skeleton->dirty_list[w] = skeleton_dirty_list[w];
+		skeleton_dirty_list[w] = skeleton;
+		// The version bump and the dependency notification belong to the writer (the scene
+		// update), once per frame: the scene cull's callback queues an instance update on the
+		// list the update node drains, so it must not fire from the record node's upload.
+		skeleton->version++;
+		skeleton->dependency.changed_notify(Dependency::DEPENDENCY_CHANGED_SKELETON_BONES);
 	}
+}
+
+float *MeshStorage::_skeleton_write_data(Skeleton *skeleton) {
+	const int w = skeleton_write_slot;
+	if (skeleton->latest != w && !skeleton->dirty[w]) {
+		// First write into this slot this frame: start from the newest bones, so a partial
+		// update keeps the bones it does not touch.
+		skeleton->data[w] = skeleton->data[skeleton->latest];
+	}
+	skeleton->latest = uint8_t(w);
+	return skeleton->data[w].ptr();
 }
 
 void MeshStorage::skeleton_allocate_data(RID p_skeleton, int p_bones, bool p_2d_skeleton) {
@@ -2384,15 +2401,19 @@ void MeshStorage::skeleton_allocate_data(RID p_skeleton, int p_bones, bool p_2d_
 	if (skeleton->buffer.is_valid()) {
 		RD::get_singleton()->free_rid(skeleton->buffer);
 		skeleton->buffer = RID();
-		skeleton->data.clear();
+		for (int i = 0; i < 3; i++) {
+			skeleton->data[i].clear();
+		}
 		skeleton->uniform_set_mi = RID();
 	}
 
 	if (skeleton->size) {
-		skeleton->data.resize(skeleton->size * (skeleton->use_2d ? 8 : 12));
-		skeleton->buffer = RD::get_singleton()->storage_buffer_create(skeleton->data.size() * sizeof(float));
-		memset(skeleton->data.ptr(), 0, skeleton->data.size() * sizeof(float));
-
+		for (int i = 0; i < 3; i++) {
+			skeleton->data[i].resize(skeleton->size * (skeleton->use_2d ? 8 : 12));
+			memset(skeleton->data[i].ptr(), 0, skeleton->data[i].size() * sizeof(float));
+		}
+		skeleton->buffer = RD::get_singleton()->storage_buffer_create(skeleton->data[0].size() * sizeof(float));
+		skeleton->latest = uint8_t(skeleton_write_slot);
 		_skeleton_make_dirty(skeleton);
 
 		{
@@ -2425,7 +2446,7 @@ void MeshStorage::skeleton_bone_set_transform(RID p_skeleton, int p_bone, const 
 	ERR_FAIL_INDEX(p_bone, skeleton->size);
 	ERR_FAIL_COND(skeleton->use_2d);
 
-	float *dataptr = skeleton->data.ptr() + p_bone * 12;
+	float *dataptr = _skeleton_write_data(skeleton) + p_bone * 12;
 
 	dataptr[0] = p_transform.basis.rows[0][0];
 	dataptr[1] = p_transform.basis.rows[0][1];
@@ -2450,7 +2471,7 @@ Transform3D MeshStorage::skeleton_bone_get_transform(RID p_skeleton, int p_bone)
 	ERR_FAIL_INDEX_V(p_bone, skeleton->size, Transform3D());
 	ERR_FAIL_COND_V(skeleton->use_2d, Transform3D());
 
-	const float *dataptr = skeleton->data.ptr() + p_bone * 12;
+	const float *dataptr = skeleton->data[skeleton->latest].ptr() + p_bone * 12;
 
 	Transform3D t;
 
@@ -2476,7 +2497,7 @@ void MeshStorage::skeleton_bone_set_transform_2d(RID p_skeleton, int p_bone, con
 	ERR_FAIL_NULL(skeleton);
 	ERR_FAIL_INDEX(p_bone, skeleton->size);
 	ERR_FAIL_COND(!skeleton->use_2d);
-	float *dataptr = skeleton->data.ptr() + p_bone * 8;
+	float *dataptr = _skeleton_write_data(skeleton) + p_bone * 8;
 
 	dataptr[0] = p_transform.columns[0][0];
 	dataptr[1] = p_transform.columns[1][0];
@@ -2497,7 +2518,7 @@ Transform2D MeshStorage::skeleton_bone_get_transform_2d(RID p_skeleton, int p_bo
 	ERR_FAIL_INDEX_V(p_bone, skeleton->size, Transform2D());
 	ERR_FAIL_COND_V(!skeleton->use_2d, Transform2D());
 
-	const float *dataptr = skeleton->data.ptr() + p_bone * 8;
+	const float *dataptr = skeleton->data[skeleton->latest].ptr() + p_bone * 8;
 
 	Transform2D t;
 	t.columns[0][0] = dataptr[0];
@@ -2520,24 +2541,25 @@ void MeshStorage::skeleton_set_base_transform_2d(RID p_skeleton, const Transform
 }
 
 void MeshStorage::_update_dirty_skeletons() {
-	while (skeleton_dirty_list) {
-		Skeleton *skeleton = skeleton_dirty_list;
+	macrame_upload_skeletons(skeleton_write_slot);
+}
 
-		if (skeleton->size) {
-			RD::get_singleton()->buffer_update(skeleton->buffer, 0, skeleton->data.size() * sizeof(float), skeleton->data.ptr());
+void MeshStorage::macrame_upload_skeletons(int p_slot) {
+	p_slot %= 3;
+	while (skeleton_dirty_list[p_slot]) {
+		Skeleton *skeleton = skeleton_dirty_list[p_slot];
+
+		if (skeleton->size && skeleton->buffer.is_valid()) {
+			RD::get_singleton()->buffer_update(skeleton->buffer, 0, skeleton->data[p_slot].size() * sizeof(float), skeleton->data[p_slot].ptr());
 		}
 
-		skeleton_dirty_list = skeleton->dirty_list;
+		skeleton_dirty_list[p_slot] = skeleton->dirty_list[p_slot];
 
-		skeleton->dependency.changed_notify(Dependency::DEPENDENCY_CHANGED_SKELETON_BONES);
-
-		skeleton->version++;
-
-		skeleton->dirty = false;
-		skeleton->dirty_list = nullptr;
+		skeleton->dirty[p_slot] = false;
+		skeleton->dirty_list[p_slot] = nullptr;
 	}
 
-	skeleton_dirty_list = nullptr;
+	skeleton_dirty_list[p_slot] = nullptr;
 }
 
 void MeshStorage::skeleton_update_dependency(RID p_skeleton, DependencyTracker *p_instance) {

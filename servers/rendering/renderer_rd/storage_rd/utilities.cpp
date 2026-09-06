@@ -253,7 +253,9 @@ void Utilities::update_dirty_resources() {
 	MaterialStorage::get_singleton()->_update_global_shader_uniforms(); //must do before materials, so it can queue them for update
 	MaterialStorage::get_singleton()->_update_queued_materials();
 	MeshStorage::get_singleton()->_update_dirty_multimeshes();
-	MeshStorage::get_singleton()->_update_dirty_skeletons();
+	if (!MeshStorage::get_singleton()->macrame_skeleton_ring_enabled()) {
+		MeshStorage::get_singleton()->_update_dirty_skeletons(); // Otherwise the record node uploads its frame's slot.
+	}
 	TextureStorage::get_singleton()->update_decal_atlas();
 	TextureStorage::get_singleton()->update_area_light_atlas();
 }

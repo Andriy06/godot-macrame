@@ -49,4 +49,8 @@ void MacrameRenderLists::release(RenderingMethod *p_scene) {
 		p_scene->cull_frame_free(f);
 	}
 	pool.clear();
+	if (run_data && owns_run_data) {
+		p_scene->macrame_run_data_free(run_data);
+	}
+	run_data = nullptr;
 }

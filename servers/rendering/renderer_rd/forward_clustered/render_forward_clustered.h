@@ -218,9 +218,44 @@ private:
 
 	struct GeometryInstanceSurfaceDataCache;
 	struct RenderElementInfo;
+	struct RenderFrameLists;
+
+	// The surface's sort key: the static part (ids, priority, projector/softshadow bits) lives in
+	// the surface cache, the per-frame part (lod, depth layer, gi/lightmap bits) in the frame's
+	// element, so a frame being recorded never reads what the next frame's fill writes.
+	union SurfaceSortKey {
+		struct {
+			uint64_t sort_key1;
+			uint64_t sort_key2;
+		};
+		struct {
+			uint64_t lod_index : 8;
+			uint64_t uses_softshadow : 1;
+			uint64_t uses_projector : 1;
+			uint64_t uses_forward_gi : 1;
+			uint64_t uses_lightmap : 1;
+			uint64_t depth_layer : 4;
+			uint64_t surface_index : 8;
+			uint64_t geometry_id : 32;
+			uint64_t material_id_hi : 8;
+			uint64_t material_id_lo : 24;
+			uint64_t shader_id : 32;
+			uint64_t priority : 8;
+		};
+	};
+
+	// One element of a frame's render list: the surface and the per-frame part of its sort key
+	// and pass membership. Owned by the frame, not by the surface cache.
+	struct RenderElement {
+		GeometryInstanceSurfaceDataCache *surf = nullptr;
+		SurfaceSortKey sort;
+		float depth = 0.0f;
+		uint32_t color_pass_inclusion_mask = 0;
+		bool uses_lightmap_specular = false;
+	};
 
 	struct RenderListParameters {
-		GeometryInstanceSurfaceDataCache **elements = nullptr;
+		const RenderElement *elements = nullptr;
 		RenderElementInfo *element_info = nullptr;
 		int element_count = 0;
 		bool reverse_cull = false;
@@ -239,7 +274,7 @@ private:
 		SceneShaderForwardClustered::ShaderSpecialization base_specialization = {};
 		bool use_material_feedback = false;
 
-		RenderListParameters(GeometryInstanceSurfaceDataCache **p_elements, RenderElementInfo *p_element_info, int p_element_count, bool p_reverse_cull, PassMode p_pass_mode, uint32_t p_color_pass_flags, bool p_no_gi, bool p_use_directional_soft_shadows, RID p_render_pass_uniform_set, bool p_force_wireframe = false, const Vector2 &p_uv_offset = Vector2(), float p_lod_distance_multiplier = 0.0, float p_screen_mesh_lod_threshold = 0.0, uint32_t p_view_count = 1, uint32_t p_element_offset = 0, SceneShaderForwardClustered::ShaderSpecialization p_base_specialization = {}, bool p_use_material_feedback = false) {
+		RenderListParameters(const RenderElement *p_elements, RenderElementInfo *p_element_info, int p_element_count, bool p_reverse_cull, PassMode p_pass_mode, uint32_t p_color_pass_flags, bool p_no_gi, bool p_use_directional_soft_shadows, RID p_render_pass_uniform_set, bool p_force_wireframe = false, const Vector2 &p_uv_offset = Vector2(), float p_lod_distance_multiplier = 0.0, float p_screen_mesh_lod_threshold = 0.0, uint32_t p_view_count = 1, uint32_t p_element_offset = 0, SceneShaderForwardClustered::ShaderSpecialization p_base_specialization = {}, bool p_use_material_feedback = false) {
 			elements = p_elements;
 			element_info = p_element_info;
 			element_count = p_element_count;
@@ -452,8 +487,9 @@ private:
 	static RenderForwardClustered *singleton;
 
 	uint32_t _setup_environment(const RenderDataRD *p_render_data, bool p_no_fog, const Size2i &p_screen_size, const Size2 &p_viewport_size, const Color &p_default_bg_color, bool p_opaque_render_buffers = false, bool p_apply_alpha_multiplier = false, bool p_pancake_shadows = false);
-	void _setup_voxelgis(const PagedArray<RID> &p_voxelgis);
-	void _setup_lightmaps(const RenderDataRD *p_render_data, const PagedArray<RID> &p_lightmaps, const Transform3D &p_cam_transform);
+	void _setup_voxelgis(RenderFrameLists &p_lists, const PagedArray<RID> &p_voxelgis);
+	void _setup_lightmaps(RenderFrameLists &p_lists, const RenderDataRD *p_render_data, const PagedArray<RID> &p_lightmaps, const Transform3D &p_cam_transform);
+	void _upload_lightmaps(const RenderFrameLists &p_lists);
 
 	struct RenderElementInfo {
 		enum { MAX_REPEATS = (1 << 20) - 1 };
@@ -501,8 +537,12 @@ private:
 
 	void _render_list_with_draw_list(RenderListParameters *p_params, RID p_framebuffer, BitField<RD::DrawFlags> p_draw_flags = RD::DRAW_DEFAULT_ALL, const Vector<Color> &p_clear_color_values = Vector<Color>(), float p_clear_depth_value = 0.0, uint32_t p_clear_stencil_value = 0, const Rect2 &p_region = Rect2());
 
-	void _fill_instance_data(RenderListType p_render_list, int *p_render_info = nullptr, uint32_t p_offset = 0, int32_t p_max_elements = -1, bool p_update_buffer = true);
-	void _fill_render_list(RenderListType p_render_list, const RenderDataRD *p_render_data, PassMode p_pass_mode, bool p_using_sdfgi = false, bool p_using_opaque_gi = false, bool p_using_motion_pass = false, bool p_append = false);
+	void _generate_instance_data(RenderFrameLists &p_lists, RenderListType p_render_list, int *p_render_info = nullptr, uint32_t p_offset = 0, int32_t p_max_elements = -1);
+	void _upload_instance_data(RenderFrameLists &p_lists, RenderListType p_render_list, bool p_flush = true);
+	void _fill_render_list(RenderFrameLists &p_lists, RenderListType p_render_list, const RenderDataRD *p_render_data, PassMode p_pass_mode, bool p_using_sdfgi = false, bool p_using_opaque_gi = false, bool p_using_motion_pass = false, bool p_append = false);
+	void _prepare_shadow_fills(RenderFrameLists &p_lists, RenderDataRD *p_render_data);
+	virtual bool _prepare_scene_lists(FrameRenderData *p_fd, RenderDataRD *p_render_data) override;
+	virtual void _render_prepared_scene(FrameRenderData *p_fd, RenderDataRD *p_render_data, const Color &p_default_color) override;
 
 	HashMap<Size2i, RID> sdfgi_framebuffer_size_cache;
 
@@ -531,33 +571,7 @@ private:
 			FLAG_USES_STENCIL = 262144,
 		};
 
-		union {
-			struct {
-				uint64_t sort_key1;
-				uint64_t sort_key2;
-			};
-			struct {
-				// Needs to be grouped together to be used in RenderElementInfo, as the value is masked directly.
-				uint64_t lod_index : 8;
-				uint64_t uses_softshadow : 1;
-				uint64_t uses_projector : 1;
-				uint64_t uses_forward_gi : 1;
-				uint64_t uses_lightmap : 1;
-				// "uses_lightmap_specular" is excluded as there are no more available bits.
-
-				// Sorted based on optimal order for respecting priority and reducing the amount of rebinding of shaders, materials,
-				// and geometry. This current order was found to be the most optimal in large projects. If you wish to measure
-				// differences, refer to RenderingDeviceGraph and the methods available to print statistics for draw lists.
-				uint64_t depth_layer : 4;
-				uint64_t surface_index : 8;
-				uint64_t geometry_id : 32;
-				uint64_t material_id_hi : 8;
-
-				uint64_t material_id_lo : 24;
-				uint64_t shader_id : 32;
-				uint64_t priority : 8;
-			};
-		} sort;
+		SurfaceSortKey sort;
 
 		RSE::PrimitiveType primitive = RSE::PRIMITIVE_MAX;
 		uint32_t flags = 0;
@@ -612,6 +626,7 @@ private:
 		Transform3D prev_transform;
 		RID voxel_gi_instances[MAX_VOXEL_GI_INSTANCESS_PER_INSTANCE];
 		GeometryInstanceSurfaceDataCache *surface_caches = nullptr;
+		bool pending_free = false; // Freed, waiting for the record node: never rebuilt, never re-marked.
 		SelfList<GeometryInstanceForwardClustered> dirty_list_element;
 
 		GeometryInstanceForwardClustered() :
@@ -710,7 +725,7 @@ private:
 	/* Render List */
 
 	struct RenderList {
-		LocalVector<GeometryInstanceSurfaceDataCache *> elements;
+		LocalVector<RenderElement> elements;
 		LocalVector<RenderElementInfo> element_info;
 
 		void clear() {
@@ -721,51 +736,105 @@ private:
 		//should eventually be replaced by radix
 
 		struct SortByKey {
-			_FORCE_INLINE_ bool operator()(const GeometryInstanceSurfaceDataCache *A, const GeometryInstanceSurfaceDataCache *B) const {
-				return (A->sort.sort_key2 == B->sort.sort_key2) ? (A->sort.sort_key1 < B->sort.sort_key1) : (A->sort.sort_key2 < B->sort.sort_key2);
+			_FORCE_INLINE_ bool operator()(const RenderElement &A, const RenderElement &B) const {
+				return (A.sort.sort_key2 == B.sort.sort_key2) ? (A.sort.sort_key1 < B.sort.sort_key1) : (A.sort.sort_key2 < B.sort.sort_key2);
 			}
 		};
 
 		void sort_by_key() {
-			SortArray<GeometryInstanceSurfaceDataCache *, SortByKey> sorter;
+			SortArray<RenderElement, SortByKey> sorter;
 			sorter.sort(elements.ptr(), elements.size());
 		}
 
 		void sort_by_key_range(uint32_t p_from, uint32_t p_size) {
-			SortArray<GeometryInstanceSurfaceDataCache *, SortByKey> sorter;
+			SortArray<RenderElement, SortByKey> sorter;
 			sorter.sort(elements.ptr() + p_from, p_size);
 		}
 
 		struct SortByDepth {
-			_FORCE_INLINE_ bool operator()(const GeometryInstanceSurfaceDataCache *A, const GeometryInstanceSurfaceDataCache *B) const {
-				return (A->owner->depth < B->owner->depth);
+			_FORCE_INLINE_ bool operator()(const RenderElement &A, const RenderElement &B) const {
+				return (A.depth < B.depth);
 			}
 		};
 
 		void sort_by_depth() { //used for shadows
 
-			SortArray<GeometryInstanceSurfaceDataCache *, SortByDepth> sorter;
+			SortArray<RenderElement, SortByDepth> sorter;
 			sorter.sort(elements.ptr(), elements.size());
 		}
 
 		struct SortByReverseDepthAndPriority {
-			_FORCE_INLINE_ bool operator()(const GeometryInstanceSurfaceDataCache *A, const GeometryInstanceSurfaceDataCache *B) const {
-				return (A->sort.priority == B->sort.priority) ? (A->owner->depth > B->owner->depth) : (A->sort.priority < B->sort.priority);
+			_FORCE_INLINE_ bool operator()(const RenderElement &A, const RenderElement &B) const {
+				return (A.sort.priority == B.sort.priority) ? (A.depth > B.depth) : (A.sort.priority < B.sort.priority);
 			}
 		};
 
 		void sort_by_reverse_depth_and_priority() { //used for alpha
 
-			SortArray<GeometryInstanceSurfaceDataCache *, SortByReverseDepthAndPriority> sorter;
+			SortArray<RenderElement, SortByReverseDepthAndPriority> sorter;
 			sorter.sort(elements.ptr(), elements.size());
 		}
 
-		_FORCE_INLINE_ void add_element(GeometryInstanceSurfaceDataCache *p_element) {
+		_FORCE_INLINE_ void add_element(const RenderElement &p_element) {
 			elements.push_back(p_element);
 		}
 	};
 
-	RenderList render_list[RENDER_LIST_MAX];
+	// Macrame: a frame's lists - everything the fill produces and the record consumes: the render
+	// lists with their per-element data, the instance data as a CPU array (uploaded by the
+	// record), the shadow passes' element ranges, the lightmap / voxel GI setup, the feature flags
+	// the fill discovered. One per cull frame, plus the scratch one of the combined path.
+	struct RenderFrameLists : public FrameRenderData {
+		RenderList lists[RENDER_LIST_MAX];
+		LocalVector<SceneState::InstanceData> instance_data[RENDER_LIST_MAX];
+		struct ShadowPassFill {
+			uint32_t element_from = 0;
+			uint32_t element_count = 0;
+			bool prepared = false; // False: the record fills it itself (cube shadows).
+		};
+		LocalVector<ShadowPassFill> shadow_fills; // Indexed like `render_shadows`.
+		LightmapData lightmaps[MAX_LIGHTMAPS];
+		RID lightmap_ids[MAX_LIGHTMAPS];
+		bool lightmap_has_sh[MAX_LIGHTMAPS];
+		bool lightmap_has_specular[MAX_LIGHTMAPS];
+		uint32_t lightmaps_used = 0;
+		RID voxelgi_ids[MAX_VOXEL_GI_INSTANCESS];
+		uint32_t voxelgis_used = 0;
+		LocalVector<LightmapCaptureData> lightmap_captures;
+		uint32_t lightmap_captures_used = 0;
+		bool used_screen_texture = false;
+		bool used_normal_texture = false;
+		bool used_depth_texture = false;
+		bool used_sss = false;
+		bool used_lightmap = false;
+		bool used_opaque_stencil = false;
+	};
+	RenderFrameLists *_scratch_lists() { return static_cast<RenderFrameLists *>(_scratch_frame_data()); }
+
+	// Macrame: what the update node produced for the record node, per run: surfaces to register
+	// for pipeline compilation, and the frees deferred until no recorded frame references them.
+	struct RunData {
+		LocalVector<GeometryInstanceSurfaceDataCache *> new_surfaces;
+		LocalVector<GeometryInstanceSurfaceDataCache *> surface_frees;
+		LocalVector<GeometryInstanceForwardClustered *> instance_frees;
+	};
+	LocalVector<GeometryInstanceSurfaceDataCache *> pending_new_surfaces;
+	LocalVector<GeometryInstanceSurfaceDataCache *> pending_surface_frees;
+	LocalVector<GeometryInstanceForwardClustered *> pending_instance_frees;
+	bool defer_frees = true; // Off from the destructor on: nothing is in flight, free at once.
+	void _defer_surface_free(GeometryInstanceSurfaceDataCache *p_surface) {
+		if (!defer_frees) {
+			if (p_surface->compilation_dirty_element.in_list()) {
+				p_surface->compilation_dirty_element.remove_from_list();
+			}
+			if (p_surface->compilation_all_element.in_list()) {
+				p_surface->compilation_all_element.remove_from_list();
+			}
+			geometry_instance_surface_alloc.free(p_surface);
+			return;
+		}
+		pending_surface_frees.push_back(p_surface);
+	}
 
 	virtual void _update_shader_quality_settings() override;
 
@@ -795,18 +864,18 @@ private:
 
 	/* Render shadows */
 
-	void _render_shadow_pass(RID p_light, RID p_shadow_atlas, int p_pass, const PagedArray<RenderGeometryInstance *> &p_instances, float p_lod_distance_multiplier = 0, float p_screen_mesh_lod_threshold = 0.0, bool p_open_pass = true, bool p_close_pass = true, bool p_clear_region = true, RenderingServerTypes::RenderInfo *p_render_info = nullptr, const Size2i &p_viewport_size = Size2i(1, 1), const Transform3D &p_main_cam_transform = Transform3D());
+	void _render_shadow_pass(RenderFrameLists &p_lists, RID p_light, RID p_shadow_atlas, int p_pass, const PagedArray<RenderGeometryInstance *> &p_instances, float p_lod_distance_multiplier = 0, float p_screen_mesh_lod_threshold = 0.0, bool p_open_pass = true, bool p_close_pass = true, bool p_clear_region = true, RenderingServerTypes::RenderInfo *p_render_info = nullptr, const Size2i &p_viewport_size = Size2i(1, 1), const Transform3D &p_main_cam_transform = Transform3D(), int32_t p_prepared_from = -1, uint32_t p_prepared_count = 0);
 	void _render_shadow_begin();
-	void _render_shadow_append(RID p_framebuffer, const PagedArray<RenderGeometryInstance *> &p_instances, const Projection &p_projection, const Transform3D &p_transform, float p_zfar, float p_bias, float p_normal_bias, bool p_reverse_cull_face, bool p_use_dp, bool p_use_dp_flip, bool p_use_pancake, float p_lod_distance_multiplier = 0.0, float p_screen_mesh_lod_threshold = 0.0, const Rect2i &p_rect = Rect2i(), bool p_flip_y = false, bool p_clear_region = true, bool p_begin = true, bool p_end = true, RenderingServerTypes::RenderInfo *p_render_info = nullptr, const Size2i &p_viewport_size = Size2i(1, 1), const Transform3D &p_main_cam_transform = Transform3D());
-	void _render_shadow_process();
-	void _render_shadow_end();
+	void _render_shadow_append(RenderFrameLists &p_lists, RID p_framebuffer, const PagedArray<RenderGeometryInstance *> &p_instances, const Projection &p_projection, const Transform3D &p_transform, float p_zfar, float p_bias, float p_normal_bias, bool p_reverse_cull_face, bool p_use_dp, bool p_use_dp_flip, bool p_use_pancake, float p_lod_distance_multiplier = 0.0, float p_screen_mesh_lod_threshold = 0.0, const Rect2i &p_rect = Rect2i(), bool p_flip_y = false, bool p_clear_region = true, bool p_begin = true, bool p_end = true, RenderingServerTypes::RenderInfo *p_render_info = nullptr, const Size2i &p_viewport_size = Size2i(1, 1), const Transform3D &p_main_cam_transform = Transform3D(), int32_t p_prepared_from = -1, uint32_t p_prepared_count = 0);
+	void _render_shadow_process(RenderFrameLists &p_lists);
+	void _render_shadow_end(RenderFrameLists &p_lists);
 
 	/* Render Scene */
 	void _process_ssao(Ref<RenderSceneBuffersRD> p_render_buffers, RID p_environment, const RID *p_normal_buffers, const Projection *p_projections);
 	void _process_ssil(Ref<RenderSceneBuffersRD> p_render_buffers, RID p_environment, const RID *p_normal_buffers, const Projection *p_projections, const Transform3D &p_transform);
 	void _process_ssr(Ref<RenderSceneBuffersRD> p_render_buffers, RID p_environment, const RID *p_normal_slices, const Projection *p_projections, const Vector3 *p_eye_offsets, const Transform3D &p_transform);
 	void _copy_framebuffer_to_ss_effects(Ref<RenderSceneBuffersRD> p_render_buffers, bool p_use_ssil, bool p_use_ssr);
-	void _pre_opaque_render(RenderDataRD *p_render_data, bool p_use_ssao, bool p_use_ssil, bool p_use_ssr, bool p_use_gi, const RID *p_normal_roughness_slices, RID p_voxel_gi_buffer);
+	void _pre_opaque_render(RenderFrameLists &p_lists, RenderDataRD *p_render_data, bool p_use_ssao, bool p_use_ssil, bool p_use_ssr, bool p_use_gi, const RID *p_normal_roughness_slices, RID p_voxel_gi_buffer);
 	void _process_sss(Ref<RenderSceneBuffersRD> p_render_buffers, const Projection &p_camera);
 
 	/* Debug */
@@ -877,6 +946,12 @@ public:
 	virtual bool free(RID p_rid) override;
 
 	virtual void update() override;
+	virtual void *frame_data_create() override;
+	virtual void update_geometry_instances() override;
+	virtual void *run_data_create() override;
+	virtual void run_data_free(void *p_run_data) override;
+	virtual void collect_run_data(void *p_run_data) override;
+	virtual void apply_run_data(void *p_run_data) override;
 
 	RenderForwardClustered();
 	~RenderForwardClustered();

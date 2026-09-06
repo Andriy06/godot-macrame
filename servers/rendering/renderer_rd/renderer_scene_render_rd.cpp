@@ -37,6 +37,7 @@
 #include "servers/rendering/renderer_rd/shaders/decal_data_inc.glsl.gen.h"
 #include "servers/rendering/renderer_rd/shaders/light_data_inc.glsl.gen.h"
 #include "servers/rendering/renderer_rd/shaders/scene_data_inc.glsl.gen.h"
+#include "servers/rendering/renderer_rd/storage_rd/mesh_storage.h"
 #include "servers/rendering/renderer_rd/storage_rd/particles_storage.h"
 #include "servers/rendering/renderer_rd/storage_rd/texture_storage.h"
 #include "servers/rendering/rendering_server_default.h"
@@ -1361,7 +1362,7 @@ void RendererSceneRenderRD::_post_prepass_render(RenderDataRD *p_render_data, bo
 	}
 }
 
-void RendererSceneRenderRD::render_scene(const Ref<RenderSceneBuffers> &p_render_buffers, const CameraData *p_camera_data, const CameraData *p_prev_camera_data, const PagedArray<RenderGeometryInstance *> &p_instances, const PagedArray<RID> &p_lights, const PagedArray<RID> &p_reflection_probes, const PagedArray<RID> &p_voxel_gi_instances, const PagedArray<RID> &p_decals, const PagedArray<RID> &p_lightmaps, const PagedArray<RID> &p_fog_volumes, RID p_environment, RID p_camera_attributes, RID p_compositor, RID p_shadow_atlas, RID p_occluder_debug_tex, RID p_reflection_atlas, RID p_reflection_probe, int p_reflection_probe_pass, float p_screen_mesh_lod_threshold, const RenderShadowData *p_render_shadows, int p_render_shadow_count, const RenderSDFGIData *p_render_sdfgi_regions, int p_render_sdfgi_region_count, float p_window_output_max_value, const RenderSDFGIUpdateData *p_sdfgi_update_data, RenderingServerTypes::RenderInfo *r_render_info) {
+void RendererSceneRenderRD::_build_render_data(FrameRenderData &r_fd, const Ref<RenderSceneBuffers> &p_render_buffers, const CameraData *p_camera_data, const CameraData *p_prev_camera_data, const PagedArray<RenderGeometryInstance *> &p_instances, const PagedArray<RID> &p_lights, const PagedArray<RID> &p_reflection_probes, const PagedArray<RID> &p_voxel_gi_instances, const PagedArray<RID> &p_decals, const PagedArray<RID> &p_lightmaps, const PagedArray<RID> &p_fog_volumes, RID p_environment, RID p_camera_attributes, RID p_compositor, RID p_shadow_atlas, RID p_occluder_debug_tex, RID p_reflection_atlas, RID p_reflection_probe, int p_reflection_probe_pass, float p_screen_mesh_lod_threshold, const RenderShadowData *p_render_shadows, int p_render_shadow_count, const RenderSDFGIData *p_render_sdfgi_regions, int p_render_sdfgi_region_count, float p_window_output_max_value, const RenderSDFGIUpdateData *p_sdfgi_update_data, RenderingServerTypes::RenderInfo *r_render_info) {
 	RendererRD::LightStorage *light_storage = RendererRD::LightStorage::get_singleton();
 	RendererRD::TextureStorage *texture_storage = RendererRD::TextureStorage::get_singleton();
 
@@ -1371,7 +1372,13 @@ void RendererSceneRenderRD::render_scene(const Ref<RenderSceneBuffers> &p_render
 	ERR_FAIL_COND(rb.is_null());
 
 	// setup scene data
-	RenderSceneDataRD scene_data;
+	RenderSceneDataRD &scene_data = r_fd.scene_data;
+	// The frame's scene data is reused run after run: the fields the block below sets only under a
+	// condition go back to their defaults first.
+	scene_data.shadow_atlas_pixel_size = Vector2();
+	scene_data.radiance_pixel_size = 0.0f;
+	scene_data.radiance_border_size = 0.0f;
+	scene_data.reflection_atlas_border_size = Vector2();
 	{
 		// Our first camera is used by default
 		scene_data.cam_transform = p_camera_data->main_transform;
@@ -1446,7 +1453,9 @@ void RendererSceneRenderRD::render_scene(const Ref<RenderSceneBuffers> &p_render
 	}
 
 	//assign render data
-	RenderDataRD render_data;
+	RenderDataRD &render_data = r_fd.render_data;
+	render_data.transparent_bg = false;
+	render_data.render_region = Rect2i();
 	{
 		render_data.render_buffers = rb;
 		render_data.scene_data = &scene_data;
@@ -1482,7 +1491,7 @@ void RendererSceneRenderRD::render_scene(const Ref<RenderSceneBuffers> &p_render
 		}
 	}
 
-	PagedArray<RID> empty;
+	PagedArray<RID> &empty = r_fd.empty;
 
 	if (get_debug_draw_mode() == RSE::VIEWPORT_DEBUG_DRAW_UNSHADED || get_debug_draw_mode() == RSE::VIEWPORT_DEBUG_DRAW_OVERDRAW) {
 		render_data.lights = &empty;
@@ -1498,15 +1507,57 @@ void RendererSceneRenderRD::render_scene(const Ref<RenderSceneBuffers> &p_render
 		render_data.decals = &empty;
 	}
 
-	Color clear_color;
+	Color &clear_color = r_fd.clear_color;
 	if (p_render_buffers.is_valid() && p_reflection_probe.is_null()) {
 		clear_color = texture_storage->render_target_get_clear_request_color(rb->get_render_target());
 	} else {
 		clear_color = RSG::texture_storage->get_default_clear_color();
 	}
+}
 
+
+RendererSceneRenderRD::FrameRenderData *RendererSceneRenderRD::_scratch_frame_data() {
+	if (!scratch_frame_data) {
+		scratch_frame_data = static_cast<FrameRenderData *>(frame_data_create());
+	}
+	return scratch_frame_data;
+}
+
+void *RendererSceneRenderRD::frame_data_create() {
+	return memnew(FrameRenderData);
+}
+
+void RendererSceneRenderRD::frame_data_free(void *p_frame_data) {
+	if (p_frame_data) {
+		memdelete(static_cast<FrameRenderData *>(p_frame_data));
+	}
+}
+
+void RendererSceneRenderRD::render_scene(const Ref<RenderSceneBuffers> &p_render_buffers, const CameraData *p_camera_data, const CameraData *p_prev_camera_data, const PagedArray<RenderGeometryInstance *> &p_instances, const PagedArray<RID> &p_lights, const PagedArray<RID> &p_reflection_probes, const PagedArray<RID> &p_voxel_gi_instances, const PagedArray<RID> &p_decals, const PagedArray<RID> &p_lightmaps, const PagedArray<RID> &p_fog_volumes, RID p_environment, RID p_camera_attributes, RID p_compositor, RID p_shadow_atlas, RID p_occluder_debug_tex, RID p_reflection_atlas, RID p_reflection_probe, int p_reflection_probe_pass, float p_screen_mesh_lod_threshold, const RenderShadowData *p_render_shadows, int p_render_shadow_count, const RenderSDFGIData *p_render_sdfgi_regions, int p_render_sdfgi_region_count, float p_window_output_max_value, const RenderSDFGIUpdateData *p_sdfgi_update_data, RenderingServerTypes::RenderInfo *r_render_info) {
+	// The combined path: build, prepare and render at once over the scratch frame.
+	FrameRenderData *fd = _scratch_frame_data();
+	_build_render_data(*fd, p_render_buffers, p_camera_data, p_prev_camera_data, p_instances, p_lights, p_reflection_probes, p_voxel_gi_instances, p_decals, p_lightmaps, p_fog_volumes, p_environment, p_camera_attributes, p_compositor, p_shadow_atlas, p_occluder_debug_tex, p_reflection_atlas, p_reflection_probe, p_reflection_probe_pass, p_screen_mesh_lod_threshold, p_render_shadows, p_render_shadow_count, p_render_sdfgi_regions, p_render_sdfgi_region_count, p_window_output_max_value, p_sdfgi_update_data, r_render_info);
 	//calls _pre_opaque_render between depth pre-pass and opaque pass
-	_render_scene(&render_data, clear_color);
+	_render_scene(&fd->render_data, fd->clear_color);
+}
+
+bool RendererSceneRenderRD::prepare_scene(void *p_frame_data, const Ref<RenderSceneBuffers> &p_render_buffers, const CameraData *p_camera_data, const CameraData *p_prev_camera_data, const PagedArray<RenderGeometryInstance *> &p_instances, const PagedArray<RID> &p_lights, const PagedArray<RID> &p_reflection_probes, const PagedArray<RID> &p_voxel_gi_instances, const PagedArray<RID> &p_decals, const PagedArray<RID> &p_lightmaps, const PagedArray<RID> &p_fog_volumes, RID p_environment, RID p_camera_attributes, RID p_compositor, RID p_shadow_atlas, RID p_occluder_debug_tex, RID p_reflection_atlas, RID p_reflection_probe, int p_reflection_probe_pass, float p_screen_mesh_lod_threshold, const RenderShadowData *p_render_shadows, int p_render_shadow_count, const RenderSDFGIData *p_render_sdfgi_regions, int p_render_sdfgi_region_count, float p_window_output_max_value, const RenderSDFGIUpdateData *p_sdfgi_update_data, RenderingServerTypes::RenderInfo *r_render_info) {
+	FrameRenderData *fd = static_cast<FrameRenderData *>(p_frame_data);
+	ERR_FAIL_NULL_V(fd, false);
+	_build_render_data(*fd, p_render_buffers, p_camera_data, p_prev_camera_data, p_instances, p_lights, p_reflection_probes, p_voxel_gi_instances, p_decals, p_lightmaps, p_fog_volumes, p_environment, p_camera_attributes, p_compositor, p_shadow_atlas, p_occluder_debug_tex, p_reflection_atlas, p_reflection_probe, p_reflection_probe_pass, p_screen_mesh_lod_threshold, p_render_shadows, p_render_shadow_count, p_render_sdfgi_regions, p_render_sdfgi_region_count, p_window_output_max_value, p_sdfgi_update_data, r_render_info);
+	fd->prepared = _prepare_scene_lists(fd, &fd->render_data);
+	return fd->prepared;
+}
+
+void RendererSceneRenderRD::render_prepared_scene(void *p_frame_data) {
+	FrameRenderData *fd = static_cast<FrameRenderData *>(p_frame_data);
+	ERR_FAIL_NULL(fd);
+	if (fd->prepared) {
+		_render_prepared_scene(fd, &fd->render_data, fd->clear_color);
+	} else {
+		_render_scene(&fd->render_data, fd->clear_color);
+	}
+	fd->prepared = false;
 }
 
 void RendererSceneRenderRD::render_material(const Transform3D &p_cam_transform, const Projection &p_cam_projection, bool p_cam_orthogonal, const PagedArray<RenderGeometryInstance *> &p_instances, RID p_framebuffer, const Rect2i &p_region) {
@@ -1561,6 +1612,19 @@ void RendererSceneRenderRD::set_debug_draw_mode(RSE::ViewportDebugDraw p_debug_d
 
 void RendererSceneRenderRD::update() {
 	sky.update_dirty_skys();
+}
+
+void RendererSceneRenderRD::macrame_upload_frame_resources(uint64_t p_frame) {
+	RendererRD::MeshStorage *mesh_storage = RendererRD::MeshStorage::get_singleton();
+	if (mesh_storage->macrame_skeleton_ring_enabled()) {
+		mesh_storage->macrame_upload_skeletons(int(p_frame % 3));
+	}
+}
+
+void RendererSceneRenderRD::macrame_frame_posted(uint64_t p_frame) {
+	RendererRD::MeshStorage *mesh_storage = RendererRD::MeshStorage::get_singleton();
+	mesh_storage->macrame_enable_skeleton_ring(true);
+	mesh_storage->macrame_set_skeleton_write_slot(int(p_frame % 3));
 }
 
 void RendererSceneRenderRD::set_time(double p_time, double p_step) {
@@ -1890,6 +1954,10 @@ void RendererSceneRenderRD::init() {
 }
 
 RendererSceneRenderRD::~RendererSceneRenderRD() {
+	if (scratch_frame_data) {
+		frame_data_free(scratch_frame_data);
+		scratch_frame_data = nullptr;
+	}
 	memdelete(forward_id_storage);
 
 	memdelete(bokeh_dof);

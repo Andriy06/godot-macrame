@@ -361,10 +361,23 @@ public:
 	virtual void cull_frame_free(RenderSceneCullFrame *p_frame) {}
 	virtual void cull_camera(RenderSceneCullFrame *p_frame, const Ref<RenderSceneBuffers> &p_render_buffers, RID p_camera, RID p_scenario, RID p_viewport, Size2 p_viewport_size, uint32_t p_jitter_phase_count, float p_mesh_lod_threshold, RID p_shadow_atlas, Ref<XRInterface> &p_xr_interface, float p_window_output_max_value, RenderingServerTypes::RenderInfo *r_render_info = nullptr) {}
 	virtual void draw_culled(RenderSceneCullFrame *p_frame) {}
+	virtual void cull_frame_set_number(RenderSceneCullFrame *p_frame, uint64_t p_frame_number) {}
+	virtual void cull_frame_copy_render_info(const RenderSceneCullFrame *p_frame, RenderingServerTypes::RenderInfo *r_render_info) {}
 	virtual bool cull_frame_matches(const RenderSceneCullFrame *p_frame, const Ref<RenderSceneBuffers> &p_render_buffers) const { return false; }
 	// The device-side part of `update()` (resource uploads, collider renders), for the node that
 	// holds the recording grant; `update()` itself skips it once `macrame_set_defer_device_update`.
 	virtual void macrame_set_defer_device_update(bool p_defer) {}
+	// The blue thread posted frame `p_frame` for the next scene update.
+	virtual void macrame_frame_posted(uint64_t p_frame) {}
+	// The record node, for the frame it records: the per-frame resource uploads.
+	virtual void macrame_upload_frame_resources(uint64_t p_frame) {}
+	// The renderer's per-run hand-off from the update node to the record node (opaque).
+	virtual void *macrame_run_data_create() { return nullptr; }
+	virtual void macrame_run_data_free(void *p_run_data) {}
+	virtual void macrame_collect_run_data(void *p_run_data) {}
+	virtual void macrame_apply_run_data(void *p_run_data) {}
+	// Shutdown: the scene renderer is about to go; release what it owns on this side.
+	virtual void macrame_before_renderer_free() {}
 	virtual bool macrame_device_update_deferred() const { return false; }
 	virtual void macrame_device_update() {}
 

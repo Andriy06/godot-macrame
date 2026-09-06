@@ -348,6 +348,7 @@ void RendererViewport::_draw_3d(Viewport *p_viewport) {
 		RenderSceneCullFrame *frame = record_lists->find(p_viewport->self);
 		if (frame && RSG::scene->cull_frame_matches(frame, p_viewport->render_buffers)) {
 			RSG::scene->draw_culled(frame);
+			RSG::scene->cull_frame_copy_render_info(frame, &p_viewport->render_info);
 			RENDER_TIMESTAMP("< Render 3D Scene");
 			return;
 		}
@@ -871,6 +872,7 @@ void RendererViewport::macrame_cull_viewports(MacrameRenderLists &r_lists) {
 		Ref<XRInterface> no_xr;
 		MACRAME_PHASE("cull: viewport select");
 		RSG::scene->cull_camera(frame, vp->render_buffers, vp->camera, vp->scenario, vp->self, vp->internal_size, vp->jitter_phase_count, screen_mesh_lod_threshold, vp->shadow_atlas, no_xr, vp->window_output_max_value, &vp->render_info);
+		RSG::scene->cull_frame_set_number(frame, r_lists.frame_number);
 		MacrameRenderLists::Entry e;
 		e.viewport = vp->self;
 		e.frame = frame;

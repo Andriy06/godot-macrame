@@ -2446,7 +2446,7 @@ bool RendererSceneCull::_light_instance_update_shadow(RenderSceneCullFrame &p_fr
 
 					// (mesh instance update deferred to the draw)
 
-					RSG::light_storage->light_instance_set_shadow_transform(light->instance, Projection(), light_transform, radius, 0, i, 0);
+					shadow_data.set_transform(Projection(), light_transform, radius, 0, i, 0);
 					shadow_data.light = light->instance;
 					shadow_data.pass = i;
 				}
@@ -2528,14 +2528,14 @@ bool RendererSceneCull::_light_instance_update_shadow(RenderSceneCullFrame &p_fr
 					}
 
 					// (mesh instance update deferred to the draw)
-					RSG::light_storage->light_instance_set_shadow_transform(light->instance, cm, xform, radius, 0, i, 0);
+					shadow_data.set_transform(cm, xform, radius, 0, i, 0);
 
 					shadow_data.light = light->instance;
 					shadow_data.pass = i;
 				}
 
 				//restore the regular DP matrix
-				//RSG::light_storage->light_instance_set_shadow_transform(light->instance, Projection(), light_transform, radius, 0, 0, 0);
+				//shadow_data.set_transform(Projection(), light_transform, radius, 0, 0, 0);
 			}
 
 		} break;
@@ -2598,7 +2598,7 @@ bool RendererSceneCull::_light_instance_update_shadow(RenderSceneCullFrame &p_fr
 
 					// (mesh instance update deferred to the draw)
 
-			RSG::light_storage->light_instance_set_shadow_transform(light->instance, cm, light_transform, radius, 0, 0, 0);
+			shadow_data.set_transform(cm, light_transform, radius, 0, 0, 0);
 			shadow_data.light = light->instance;
 			shadow_data.pass = 0;
 
@@ -2666,7 +2666,7 @@ bool RendererSceneCull::_light_instance_update_shadow(RenderSceneCullFrame &p_fr
 
 					// (mesh instance update deferred to the draw)
 
-			RSG::light_storage->light_instance_set_shadow_transform(light->instance, Projection(), light_transform, radius, 0, 0, 0);
+			shadow_data.set_transform(Projection(), light_transform, radius, 0, 0, 0);
 			shadow_data.light = light->instance;
 			shadow_data.pass = 0;
 		}
@@ -2808,6 +2808,7 @@ void RendererSceneCull::render_camera(const Ref<RenderSceneBuffers> &p_render_bu
 	// cull and the record node).
 	cull_camera(scratch_frame, p_render_buffers, p_camera, p_scenario, p_viewport, p_viewport_size, p_jitter_phase_count, p_screen_mesh_lod_threshold, p_shadow_atlas, p_xr_interface, p_window_output_max_value, r_render_info);
 	draw_culled(scratch_frame);
+	cull_frame_copy_render_info(scratch_frame, r_render_info);
 }
 
 void RendererSceneCull::draw_culled(RenderSceneCullFrame *p_frame) {
@@ -2820,6 +2821,18 @@ void RendererSceneCull::draw_culled(RenderSceneCullFrame *p_frame) {
 
 bool RendererSceneCull::cull_frame_matches(const RenderSceneCullFrame *p_frame, const Ref<RenderSceneBuffers> &p_render_buffers) const {
 	return p_frame && p_frame->culled && p_frame->render_buffers.ptr() == p_render_buffers.ptr();
+}
+
+void RendererSceneCull::cull_frame_copy_render_info(const RenderSceneCullFrame *p_frame, RenderingServerTypes::RenderInfo *r_render_info) {
+	if (p_frame && r_render_info) {
+		*r_render_info = p_frame->info_storage;
+	}
+}
+
+void RendererSceneCull::cull_frame_set_number(RenderSceneCullFrame *p_frame, uint64_t p_frame_number) {
+	if (p_frame) {
+		p_frame->frame_number = p_frame_number;
+	}
 }
 
 RenderSceneCullFrame *RendererSceneCull::cull_frame_create() {
@@ -2847,6 +2860,7 @@ RenderSceneCullFrame *RendererSceneCull::_cull_frame_new() {
 	f->light_culler = memnew(RenderingLightCuller);
 	f->light_culler->set_caster_culling_active(tighter_caster_culling);
 	f->light_culler->set_light_culling_active(tighter_caster_culling);
+	f->render_lists = scene_render ? scene_render->frame_data_create() : nullptr; // The scratch frame is made before the renderer is set: lazily then.
 	return f;
 }
 
@@ -2870,7 +2884,19 @@ void RendererSceneCull::_cull_frame_delete(RenderSceneCullFrame *p_frame) {
 		memdelete(p_frame->light_culler);
 		p_frame->light_culler = nullptr;
 	}
+	if (p_frame->render_lists && scene_render) {
+		scene_render->frame_data_free(p_frame->render_lists);
+	}
+	p_frame->render_lists = nullptr;
 	memdelete(p_frame);
+}
+
+void RendererSceneCull::macrame_before_renderer_free() {
+	if (scratch_frame && scratch_frame->render_lists && scene_render) {
+		scene_render->frame_data_free(scratch_frame->render_lists);
+		scratch_frame->render_lists = nullptr;
+	}
+	scene_render = nullptr;
 }
 
 void RendererSceneCull::macrame_device_update() {
@@ -3021,9 +3047,7 @@ void RendererSceneCull::_scene_cull(CullData &cull_data, InstanceCullResult &cul
 				if (base_type == RSE::INSTANCE_LIGHT) {
 					cull_result.lights.push_back(idata.instance);
 					cull_result.light_instances.push_back(RID::from_uint64(idata.instance_data_rid));
-					if (cull_data.shadow_atlas.is_valid() && RSG::light_storage->light_has_shadow(idata.base_rid)) {
-						RSG::light_storage->light_instance_mark_visible(RID::from_uint64(idata.instance_data_rid)); //mark it visible for shadow allocation later
-					}
+					// Marked visible for the shadow atlas by the draw, from the frame's light list.
 
 				} else if (base_type == RSE::INSTANCE_REFLECTION_PROBE) {
 					if (cull_data.render_reflection_probe != idata.instance) {
@@ -3399,7 +3423,14 @@ void RendererSceneCull::_cull_scene(RenderSceneCullFrame &p_frame, const Rendere
 	p_frame.screen_mesh_lod_threshold = p_screen_mesh_lod_threshold;
 	p_frame.window_output_max_value = p_window_output_max_value;
 	p_frame.using_shadows = p_using_shadows;
-	p_frame.render_info = r_render_info;
+	// The frame's own counters: the cull of one frame and the draw of another must not share
+	// the viewport's. The draw copies them out (`cull_frame_copy_render_info`).
+	for (int i = 0; i < RSE::VIEWPORT_RENDER_INFO_TYPE_MAX; i++) {
+		for (int j = 0; j < RSE::VIEWPORT_RENDER_INFO_MAX; j++) {
+			p_frame.info_storage.info[i][j] = 0;
+		}
+	}
+	p_frame.render_info = r_render_info ? &p_frame.info_storage : nullptr;
 	p_frame.mesh_instances_to_update.clear();
 	p_frame.directional_lights.clear();
 	p_frame.culled = false;
@@ -3498,6 +3529,7 @@ void RendererSceneCull::_cull_scene(RenderSceneCullFrame &p_frame, const Rendere
 		}
 
 		RSG::light_storage->set_directional_shadow_count(lights_with_shadow.size());
+		p_frame.directional_shadow_count = lights_with_shadow.size();
 
 		for (int i = 0; i < lights_with_shadow.size(); i++) {
 			_light_instance_setup_directional_shadow(p_frame, i, lights_with_shadow[i], p_camera_data->main_transform, p_camera_data->main_projection, p_camera_data->is_orthogonal, p_camera_data->vaspect);
@@ -3597,12 +3629,12 @@ void RendererSceneCull::_cull_scene(RenderSceneCullFrame &p_frame, const Rendere
 			for (uint32_t j = 0; j < cull.shadows[i].cascade_count; j++) {
 				const Cull::Shadow::Cascade &c = cull.shadows[i].cascades[j];
 				//			print_line("shadow " + itos(i) + " cascade " + itos(j) + " elements: " + itos(c.cull_result.size()));
-				RSG::light_storage->light_instance_set_shadow_transform(cull.shadows[i].light_instance, c.projection, c.transform, c.zfar, c.split, j, c.shadow_texel_size, c.bias_scale, c.range_begin, c.uv_scale);
 				if (max_shadows_used == MAX_UPDATE_SHADOWS) {
 					continue;
 				}
 				render_shadow_data[max_shadows_used].light = cull.shadows[i].light_instance;
 				render_shadow_data[max_shadows_used].pass = j;
+				render_shadow_data[max_shadows_used].set_transform(c.projection, c.transform, c.zfar, c.split, j, c.shadow_texel_size, c.bias_scale, c.range_begin, c.uv_scale);
 				render_shadow_data[max_shadows_used].instances.merge_unordered(scene_cull_result.directional_shadows[i].cascade_geometry_instances[j]);
 				max_shadows_used++;
 			}
@@ -3812,6 +3844,16 @@ void RendererSceneCull::_cull_scene(RenderSceneCullFrame &p_frame, const Rendere
 
 	/* CAPTURE THE REST FOR THE DRAW */
 
+	p_frame.shadow_lights_visible.clear();
+	if (p_shadow_atlas.is_valid()) {
+		for (uint32_t i = 0; i < (uint32_t)scene_cull_result.lights.size(); i++) {
+			Instance *ins = scene_cull_result.lights[i];
+			if (RSG::light_storage->light_has_shadow(ins->base)) {
+				p_frame.shadow_lights_visible.push_back(static_cast<InstanceLightData *>(ins->base_data)->instance);
+			}
+		}
+	}
+
 	p_frame.camera_attributes = p_force_camera_attributes.is_valid() ? p_force_camera_attributes : scenario->camera_attributes;
 	p_frame.reflection_atlas = p_reflection_probe.is_valid() ? RID() : scenario->reflection_atlas;
 	p_frame.occluders_tex = RID();
@@ -3822,6 +3864,13 @@ void RendererSceneCull::_cull_scene(RenderSceneCullFrame &p_frame, const Rendere
 		// The camera of this frame is the previous camera of the next cull; recorded here, by the
 		// cull, so the next frame's cull sees it whoever draws this one and whenever.
 		RSG::viewport->viewport_set_prev_camera_data(p_viewport, p_camera_data);
+	}
+	// The renderer's half of the cull: the lists of what to draw, device-free.
+	if (!p_frame.render_lists) {
+		p_frame.render_lists = scene_render->frame_data_create();
+	}
+	if (p_frame.render_lists) {
+		scene_render->prepare_scene(p_frame.render_lists, p_frame.render_buffers, &p_frame.camera_data, &p_frame.prev_camera_data, p_frame.cull_result.geometry_instances, p_frame.cull_result.light_instances, p_frame.cull_result.reflections, p_frame.cull_result.voxel_gi_instances, p_frame.cull_result.decals, p_frame.cull_result.lightmaps, p_frame.cull_result.fog_volumes, p_frame.environment, p_frame.camera_attributes, p_frame.compositor, p_frame.shadow_atlas, p_frame.occluders_tex, p_frame.reflection_atlas, p_frame.reflection_probe, p_frame.reflection_probe_pass, p_frame.screen_mesh_lod_threshold, p_frame.render_shadow_data, p_frame.max_shadows_used, p_frame.render_sdfgi_data, p_frame.cull.sdfgi.region_count, p_frame.window_output_max_value, &p_frame.sdfgi_update_data, p_frame.render_info);
 	}
 	p_frame.culled = true;
 }
@@ -3839,13 +3888,34 @@ void RendererSceneCull::_draw_culled_scene(RenderSceneCullFrame &p_frame) {
 
 	scene_render->set_scene_pass(p_frame.render_pass);
 
+	// The light storage writes the cull used to make, applied here under the recording grant: the
+	// visible marks for the atlas, the directional count, every shadow camera of the frame.
+	for (const RID &li : p_frame.shadow_lights_visible) {
+		RSG::light_storage->light_instance_mark_visible(li);
+	}
+	RSG::light_storage->set_directional_shadow_count(p_frame.directional_shadow_count);
+	for (uint32_t i = 0; i < p_frame.max_shadows_used; i++) {
+		const RendererSceneRender::RenderShadowData &sd = p_frame.render_shadow_data[i];
+		if (sd.has_transform) {
+			RSG::light_storage->light_instance_set_shadow_transform(sd.light, sd.projection, sd.transform, sd.zfar, sd.split, sd.pass, sd.shadow_texel_size, sd.bias_scale, sd.range_begin, sd.uv_scale);
+		}
+	}
+	// The frame's resource uploads (the skeleton slot of this frame), before skinning reads them.
+	scene_render->macrame_upload_frame_resources(p_frame.frame_number);
+	MACRAME_PHASE("rc: frame resources (skeleton slot upload)");
+
 	RENDER_TIMESTAMP("Render 3D Scene");
 	GodotProfileZone("scene_render->render_scene");
-	scene_render->render_scene(p_frame.render_buffers, &p_frame.camera_data, &p_frame.prev_camera_data, p_frame.cull_result.geometry_instances, p_frame.cull_result.light_instances, p_frame.cull_result.reflections, p_frame.cull_result.voxel_gi_instances, p_frame.cull_result.decals, p_frame.cull_result.lightmaps, p_frame.cull_result.fog_volumes, p_frame.environment, p_frame.camera_attributes, p_frame.compositor, p_frame.shadow_atlas, p_frame.occluders_tex, p_frame.reflection_atlas, p_frame.reflection_probe, p_frame.reflection_probe_pass, p_frame.screen_mesh_lod_threshold, p_frame.render_shadow_data, p_frame.max_shadows_used, p_frame.render_sdfgi_data, p_frame.cull.sdfgi.region_count, p_frame.window_output_max_value, &p_frame.sdfgi_update_data, p_frame.render_info);
+	if (p_frame.render_lists) {
+		scene_render->render_prepared_scene(p_frame.render_lists); // Draws with `render_scene` if nothing was prepared.
+	} else {
+		scene_render->render_scene(p_frame.render_buffers, &p_frame.camera_data, &p_frame.prev_camera_data, p_frame.cull_result.geometry_instances, p_frame.cull_result.light_instances, p_frame.cull_result.reflections, p_frame.cull_result.voxel_gi_instances, p_frame.cull_result.decals, p_frame.cull_result.lightmaps, p_frame.cull_result.fog_volumes, p_frame.environment, p_frame.camera_attributes, p_frame.compositor, p_frame.shadow_atlas, p_frame.occluders_tex, p_frame.reflection_atlas, p_frame.reflection_probe, p_frame.reflection_probe_pass, p_frame.screen_mesh_lod_threshold, p_frame.render_shadow_data, p_frame.max_shadows_used, p_frame.render_sdfgi_data, p_frame.cull.sdfgi.region_count, p_frame.window_output_max_value, &p_frame.sdfgi_update_data, p_frame.render_info);
+	}
 
 	MACRAME_PHASE("rc: render_scene tail");
 	for (uint32_t i = 0; i < p_frame.max_shadows_used; i++) {
 		p_frame.render_shadow_data[i].instances.clear();
+		p_frame.render_shadow_data[i].has_transform = false;
 	}
 	p_frame.max_shadows_used = 0;
 
@@ -3860,6 +3930,7 @@ void RendererSceneCull::_render_scene(const RendererSceneRender::CameraData *p_c
 	// The combined path, over the scratch frame (reflection probes, the non-split draw).
 	_cull_scene(*scratch_frame, p_camera_data, p_render_buffers, p_environment, p_force_camera_attributes, p_compositor, p_visible_layers, p_scenario, p_viewport, p_shadow_atlas, p_reflection_probe, p_reflection_probe_pass, p_screen_mesh_lod_threshold, p_window_output_max_value, p_using_shadows, r_render_info);
 	_draw_culled_scene(*scratch_frame);
+	cull_frame_copy_render_info(scratch_frame, r_render_info);
 }
 
 RID RendererSceneCull::_render_get_environment(RID p_camera, RID p_scenario) {
@@ -4529,6 +4600,8 @@ void RendererSceneCull::update() {
 			_update_dirty_instance(_instance_update_list.first()->self());
 		}
 		MACRAME_PHASE("su: dirty instances");
+		scene_render->update_geometry_instances(); // Surface caches of the dirty geometry; no pipelines, no device.
+		MACRAME_PHASE("su: dirty geometry instances");
 		return;
 	}
 	update_dirty_instances();

@@ -40,10 +40,17 @@
 class MacramePhaseProbe {
 public:
 	static bool enabled();
-	// `p_kind`: 0 plain frame, 1 tick frame, 2 tick-only, 3 synchronous (no graph).
-	static void frame_begin(int p_kind);
+	// A lane is one node body on one worker: `lane_begin` opens it (the worker running the caller
+	// is the lane's identity), `mark` charges the time since the lane's previous mark, `lane_end`
+	// charges the lane's whole span to `p_total_name`. Nodes of different lanes may run at once
+	// on different workers; a phase name belongs to one lane. `p_kind`: 0 plain frame, 1 tick
+	// frame, 2 tick-only, 3 synchronous (no graph). The report counts frames by "record node" ends.
+	static void lane_begin(int p_kind, const char *p_total_name);
 	static void mark(const char *p_name); // The end of phase `p_name`.
-	static void frame_end();
+	static void lane_end();
+	// The single-node shape: one lane for the whole frame.
+	static void frame_begin(int p_kind) { lane_begin(p_kind, "render node"); }
+	static void frame_end() { lane_end(); }
 };
 
 #define MACRAME_PHASE(m_name) MacramePhaseProbe::mark(m_name)

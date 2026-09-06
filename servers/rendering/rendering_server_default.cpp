@@ -126,10 +126,11 @@ void RenderingServerDefault::_macrame_update_node() {
 	}
 	MacrameRender::set_holds_grant(true);
 	MacrameRuntime::long_task_begin();
-	MacramePhaseProbe::frame_begin(MacrameScene::frame_graph_kind());
+	MacramePhaseProbe::lane_begin(MacrameScene::frame_graph_kind(), "scene update node");
 	command_queue.commit_previous_under_grant();
 	MACRAME_PHASE("journal apply");
 	_draw_update(render_step);
+	MacramePhaseProbe::lane_end();
 	MacrameRuntime::long_task_end();
 	MacrameRender::set_holds_grant(false);
 }
@@ -142,8 +143,17 @@ void RenderingServerDefault::_macrame_cull_node(MacrameRenderLists &p_lists) {
 		return;
 	}
 	MacrameRuntime::long_task_begin();
+	MacramePhaseProbe::lane_begin(MacrameScene::frame_graph_kind(), "cull node");
 	RSG::viewport->macrame_cull_viewports(p_lists);
-	MACRAME_PHASE("cull node");
+	if (!p_lists.run_data) {
+		p_lists.run_data = RSG::scene->macrame_run_data_create();
+		p_lists.owns_run_data = true;
+	}
+	if (p_lists.run_data) {
+		RSG::scene->macrame_collect_run_data(p_lists.run_data); // After the update node of this run.
+	}
+	MACRAME_PHASE("cull: run data");
+	MacramePhaseProbe::lane_end();
 	MacrameRuntime::long_task_end();
 }
 
@@ -158,10 +168,15 @@ void RenderingServerDefault::_macrame_record_node(const MacrameRenderLists &p_li
 	const int slot = split_draw ? render_slot : -1;
 	MacrameRecord::set_holds_grant(true);
 	MacrameRuntime::long_task_begin();
+	MacramePhaseProbe::lane_begin(MacrameScene::frame_graph_kind(), "record node");
+	if (p_lists.run_data) {
+		RSG::scene->macrame_apply_run_data(p_lists.run_data); // No recorded frame names what the update freed.
+	}
+	MACRAME_PHASE("record: run data (compile lists, deferred frees)");
 	RSG::viewport->macrame_set_record_lists(&p_lists);
 	_draw_record(render_present, render_step, slot);
 	RSG::viewport->macrame_set_record_lists(nullptr);
-	MacramePhaseProbe::frame_end();
+	MacramePhaseProbe::lane_end();
 	MacrameRuntime::long_task_end();
 	MacrameRecord::set_holds_grant(false);
 	last_render_slot = slot;
@@ -178,7 +193,10 @@ void RenderingServerDefault::_macrame_submit_node() {
 	h.valid = false;
 	MacrameRenderDevice::set_holds_grant(true);
 	MacrameRuntime::long_task_begin();
+	MacramePhaseProbe::lane_begin(MacrameScene::frame_graph_kind(), "submit node");
 	RSG::rasterizer->submit_staged(h.staged, h.present);
+	MACRAME_PHASE("submit: compile + queue submit + present");
+	MacramePhaseProbe::lane_end();
 	MacrameRuntime::long_task_end();
 	MacrameRenderDevice::set_holds_grant(false);
 }
@@ -435,6 +453,13 @@ void RenderingServerDefault::_draw_record(bool p_swap_buffers, double frame_step
 
 void RenderingServerDefault::_draw(bool p_swap_buffers, double frame_step, int p_handoff_slot) {
 	_draw_update(frame_step);
+	if (!single_run_data) {
+		single_run_data = RSG::scene->macrame_run_data_create();
+	}
+	if (single_run_data) {
+		RSG::scene->macrame_collect_run_data(single_run_data);
+		RSG::scene->macrame_apply_run_data(single_run_data);
+	}
 	_draw_record(p_swap_buffers, frame_step, p_handoff_slot);
 }
 
@@ -501,6 +526,10 @@ void RenderingServerDefault::_init() {
 void RenderingServerDefault::_finish() {
 #ifdef MACRAME_ENABLED
 	lists_guarded.access([](MacrameRenderLists &p_lists) { p_lists.release(RSG::scene); }).sync();
+	if (single_run_data) {
+		RSG::scene->macrame_run_data_free(single_run_data);
+		single_run_data = nullptr;
+	}
 	print_line(vformat("Macrame: 3D viewports drawn without a prepared cull (combined path): %d", RSG::viewport->macrame_get_cull_fallbacks()));
 	MacrameRecord::set_token(nullptr);
 #endif
@@ -510,6 +539,10 @@ void RenderingServerDefault::_finish() {
 
 	RSG::canvas->finalize();
 	memdelete(RSG::canvas);
+#ifdef MACRAME_ENABLED
+	// `finalize()` deletes the scene renderer: the scene's renderer-owned frame lists go first.
+	RSG::scene->macrame_before_renderer_free();
+#endif
 	RSG::rasterizer->finalize();
 	memdelete(RSG::viewport);
 	memdelete(RSG::rasterizer);

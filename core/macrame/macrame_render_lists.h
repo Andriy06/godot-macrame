@@ -51,8 +51,9 @@ struct MacrameRenderLists {
 	};
 	LocalVector<Entry> entries; // The frames culled this run.
 	LocalVector<RenderSceneCullFrame *> pool; // Every frame this value owns; `entries` point into it.
+	void *run_data = nullptr; // The renderer's update -> record hand-off of the run (opaque).
+	bool owns_run_data = false; // The value that created its run data frees it.
 	uint64_t frame_number = 0;
-
 	RenderSceneCullFrame *find(RID p_viewport) const {
 		for (const Entry &e : entries) {
 			if (e.viewport == p_viewport) {

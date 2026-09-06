@@ -146,6 +146,8 @@ class RenderingServerDefault : public RenderingServer {
 	bool split_render_nodes = false;
 	ts::Guarded<RecordGrantToken> record_guarded{ ts::Named{ "render_record" } };
 	ts::Guarded<MacrameRenderLists> lists_guarded{ ts::Named{ "render_lists" } };
+	void *single_run_data = nullptr; // The single-node / synchronous draw's own run hand-off.
+
 	void _macrame_update_node();
 	void _macrame_cull_node(MacrameRenderLists &p_lists);
 	void _macrame_record_node(const MacrameRenderLists &p_lists);

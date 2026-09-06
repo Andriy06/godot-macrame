@@ -90,6 +90,25 @@ protected:
 	virtual void setup_render_buffer_data(Ref<RenderSceneBuffersRD> p_render_buffers) = 0;
 
 	virtual void _render_scene(RenderDataRD *p_render_data, const Color &p_default_color) = 0;
+
+	// Macrame: a frame's render data, kept by the caller across the cull and the record. The
+	// renderer subclasses it with its lists (`frame_data_create`).
+	struct FrameRenderData {
+		RenderSceneDataRD scene_data;
+		RenderDataRD render_data;
+		PagedArray<RID> empty; // The debug draw modes point the render data at an empty list.
+		Color clear_color;
+		bool prepared = false;
+		virtual ~FrameRenderData() {}
+	};
+	FrameRenderData *scratch_frame_data = nullptr; // The combined path's frame (`render_scene`).
+	FrameRenderData *_scratch_frame_data();
+	void _build_render_data(FrameRenderData &r_fd, const Ref<RenderSceneBuffers> &p_render_buffers, const CameraData *p_camera_data, const CameraData *p_prev_camera_data, const PagedArray<RenderGeometryInstance *> &p_instances, const PagedArray<RID> &p_lights, const PagedArray<RID> &p_reflection_probes, const PagedArray<RID> &p_voxel_gi_instances, const PagedArray<RID> &p_decals, const PagedArray<RID> &p_lightmaps, const PagedArray<RID> &p_fog_volumes, RID p_environment, RID p_camera_attributes, RID p_compositor, RID p_shadow_atlas, RID p_occluder_debug_tex, RID p_reflection_atlas, RID p_reflection_probe, int p_reflection_probe_pass, float p_screen_mesh_lod_threshold, const RenderShadowData *p_render_shadows, int p_render_shadow_count, const RenderSDFGIData *p_render_sdfgi_regions, int p_render_sdfgi_region_count, float p_window_output_max_value, const RenderSDFGIUpdateData *p_sdfgi_update_data, RenderingServerTypes::RenderInfo *r_render_info);
+	// The two halves a renderer may implement; the defaults do everything in the record half.
+	virtual bool _prepare_scene_lists(FrameRenderData *p_fd, RenderDataRD *p_render_data) { return false; }
+	virtual void _render_prepared_scene(FrameRenderData *p_fd, RenderDataRD *p_render_data, const Color &p_default_color) { _render_scene(p_render_data, p_default_color); }
+
+
 	virtual void _render_buffers_debug_draw(const RenderDataRD *p_render_data);
 
 	virtual void _render_material(const Transform3D &p_cam_transform, const Projection &p_cam_projection, bool p_cam_orthogonal, const PagedArray<RenderGeometryInstance *> &p_instances, RID p_framebuffer, const Rect2i &p_region, float p_exposure_normalization) = 0;
@@ -341,6 +360,12 @@ public:
 	virtual bool free(RID p_rid) override;
 
 	virtual void update() override;
+	virtual void macrame_upload_frame_resources(uint64_t p_frame) override;
+	virtual void *frame_data_create() override;
+	virtual void frame_data_free(void *p_frame_data) override;
+	virtual bool prepare_scene(void *p_frame_data, const Ref<RenderSceneBuffers> &p_render_buffers, const CameraData *p_camera_data, const CameraData *p_prev_camera_data, const PagedArray<RenderGeometryInstance *> &p_instances, const PagedArray<RID> &p_lights, const PagedArray<RID> &p_reflection_probes, const PagedArray<RID> &p_voxel_gi_instances, const PagedArray<RID> &p_decals, const PagedArray<RID> &p_lightmaps, const PagedArray<RID> &p_fog_volumes, RID p_environment, RID p_camera_attributes, RID p_compositor, RID p_shadow_atlas, RID p_occluder_debug_tex, RID p_reflection_atlas, RID p_reflection_probe, int p_reflection_probe_pass, float p_screen_mesh_lod_threshold, const RenderShadowData *p_render_shadows, int p_render_shadow_count, const RenderSDFGIData *p_render_sdfgi_regions, int p_render_sdfgi_region_count, float p_window_output_max_value, const RenderSDFGIUpdateData *p_sdfgi_update_data = nullptr, RenderingServerTypes::RenderInfo *r_render_info = nullptr) override;
+	virtual void render_prepared_scene(void *p_frame_data) override;
+	virtual void macrame_frame_posted(uint64_t p_frame) override;
 
 	virtual void set_debug_draw_mode(RSE::ViewportDebugDraw p_debug_draw) override;
 	_FORCE_INLINE_ RSE::ViewportDebugDraw get_debug_draw_mode() const {
