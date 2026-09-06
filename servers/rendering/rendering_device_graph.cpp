@@ -31,6 +31,7 @@
 #include "rendering_device_graph.h"
 
 #ifdef MACRAME_ENABLED
+#include "core/macrame/macrame_phase_probe.h"
 #include "core/macrame/macrame_render_grant.h"
 #include "ts/access.h"
 #endif
@@ -2853,6 +2854,7 @@ void RenderingDeviceGraph::end(bool p_reorder_commands, bool p_full_barriers, RD
 		}
 	}
 
+	MACRAME_PHASE("submit: graph sort (levels)");
 	_wait_for_secondary_command_buffer_tasks();
 
 	if (command_count > 0) {

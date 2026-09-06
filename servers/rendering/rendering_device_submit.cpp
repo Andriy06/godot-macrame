@@ -138,7 +138,7 @@ void RenderingDeviceSubmit::_end_frame(Staged &p_staged) {
 
 	GodotProfileZoneGrouped(_profile_zone, "draw_graph->end");
 	p_staged.graph->end(p_staged.reorder_commands, p_staged.full_barriers, command_buffer, slot.command_buffer_pool);
-	MACRAME_PHASE("submit: graph compile");
+	MACRAME_PHASE("submit: graph replay (barriers + driver commands)");
 	GodotProfileZoneGrouped(_profile_zone, "driver->command_buffer_end");
 	driver->command_buffer_end(command_buffer);
 	GodotProfileZoneGrouped(_profile_zone, "driver->end_segment");
