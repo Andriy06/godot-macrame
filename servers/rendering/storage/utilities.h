@@ -181,6 +181,10 @@ public:
 	/* MISC */
 
 	virtual void update_dirty_resources() = 0;
+	// Macrame: the blue thread between runs (the storages copy what the record node uploads next
+	// run), and the head of the scene update node (what the update owns of the dirty resources).
+	virtual void macrame_run_boundary() {}
+	virtual void macrame_update_head() {}
 	virtual void set_debug_generate_wireframes(bool p_generate) = 0;
 
 	virtual bool has_os_feature(const String &p_feature) const = 0;

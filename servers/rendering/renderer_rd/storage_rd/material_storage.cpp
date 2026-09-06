@@ -1543,6 +1543,7 @@ MaterialStorage::MaterialStorage() {
 }
 
 MaterialStorage::~MaterialStorage() {
+	_material_apply_deferred_frees(true); // The teardown owns everything.
 	memdelete_arr(global_shader_uniforms.buffer_values);
 	memdelete_arr(global_shader_uniforms.buffer_usage);
 	memdelete_arr(global_shader_uniforms.buffer_dirty_regions);
@@ -2274,7 +2275,7 @@ void MaterialStorage::shader_set_code(RID p_shader, const String &p_code) {
 			Material *material = E;
 			material->shader_type = new_type;
 			if (material->data) {
-				memdelete(material->data);
+				_material_free_data(material->data);
 				material->data = nullptr;
 			}
 		}
@@ -2442,35 +2443,26 @@ void MaterialStorage::_material_uniform_set_erased(void *p_material) {
 }
 
 void MaterialStorage::_material_queue_update(Material *material, bool p_uniform, bool p_texture) {
-	MutexLock lock(material_update_list_mutex);
 	material->uniform_dirty = material->uniform_dirty || p_uniform;
 	material->texture_dirty = material->texture_dirty || p_texture;
 
-	if (material->update_element.in_list()) {
-		return;
-	}
-
-	material_update_list.add(&material->update_element);
+	material_update_list.add(material->update_links); // Once per slot.
 }
 
 void MaterialStorage::_update_queued_materials() {
-	SelfList<Material>::List copy;
-	{
-		MutexLock lock(material_update_list_mutex);
-		while (SelfList<Material> *E = material_update_list.first()) {
-			DEV_ASSERT(E == &E->self()->update_element);
-			material_update_list.remove(E);
-			copy.add(E);
+	LocalVector<Material *> todo;
+	material_update_list.drain([&todo](Material *p_material, bool p_live) {
+		if (p_live) {
+			p_material->params_for_update = p_material->params; // No boundary copied it: no overlap either.
 		}
-	}
+		todo.push_back(p_material);
+	});
 
-	while (SelfList<Material> *E = copy.first()) {
-		Material *material = E->self();
-		copy.remove(E);
+	for (Material *material : todo) {
 		bool uniforms_changed = false;
 
 		if (material->data) {
-			uniforms_changed = material->data->update_parameters(material->params, material->uniform_dirty, material->texture_dirty);
+			uniforms_changed = material->data->update_parameters(material->params_for_update, material->uniform_dirty, material->texture_dirty);
 		}
 		material->texture_dirty = false;
 		material->uniform_dirty = false;
@@ -2508,7 +2500,43 @@ void MaterialStorage::material_free(RID p_rid) {
 	material_set_shader(p_rid, RID()); //clean up shader
 	material->dependency.deleted_notify(p_rid);
 
+	if (material_rid_frees.defer(p_rid)) {
+		// The update node: the record node of this run may still read the struct (its update
+		// element sits in the slot being drained). Freed by the record node next run.
+		return;
+	}
+	MacrameParityList<Material>::remove(material->update_links);
 	material_owner.free(p_rid);
+}
+
+void MaterialStorage::_material_free_data(MaterialData *p_data) {
+	if (!material_data_frees.defer(p_data)) {
+		memdelete(p_data);
+	}
+}
+
+void MaterialStorage::_material_apply_deferred_frees(bool p_all) {
+	material_data_frees.apply([](MaterialData *p_data) { memdelete(p_data); }, p_all);
+	material_rid_frees.apply([this](RID p_rid) {
+		Material *material = material_owner.get_or_null(p_rid);
+		if (material) {
+			MacrameParityList<Material>::remove(material->update_links);
+			material_owner.free(p_rid);
+		}
+	}, p_all);
+}
+
+void MaterialStorage::macrame_update_head() {
+	// The update node, before the journal's frees of this run: what it freed two runs ago goes.
+	_material_apply_deferred_frees();
+}
+
+void MaterialStorage::macrame_run_boundary() {
+	material_update_list.check_boundary("queued materials");
+	// The parameters the record node's update reads next run: a copy taken while nobody writes.
+	material_update_list.for_each_written([](Material *p_material) {
+		p_material->params_for_update = p_material->params;
+	});
 }
 
 void MaterialStorage::material_set_shader(RID p_material, RID p_shader) {
@@ -2516,7 +2544,7 @@ void MaterialStorage::material_set_shader(RID p_material, RID p_shader) {
 	ERR_FAIL_NULL(material);
 
 	if (material->data) {
-		memdelete(material->data);
+		_material_free_data(material->data);
 		material->data = nullptr;
 	}
 

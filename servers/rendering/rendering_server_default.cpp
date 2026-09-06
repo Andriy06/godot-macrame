@@ -29,6 +29,7 @@
 /**************************************************************************/
 
 #include "rendering_server_default.h"
+#include "core/macrame/macrame_run_parity.h"
 
 #include "core/macrame/macrame_phase_probe.h"
 #include "core/macrame/macrame_runtime.h"
@@ -375,6 +376,9 @@ void RenderingServerDefault::_draw_record(bool p_swap_buffers, double frame_step
 #endif // XR_DISABLED
 	// The device side of the scene update: uploads, collider renders. Deferred here from
 	// `RSG::scene->update()` so the update node stays device-free.
+	if (RenderingDevice::get_singleton()) {
+		RenderingDevice::get_singleton()->macrame_free_deferred(); // What the update node freed last run.
+	}
 	RSG::scene->macrame_device_update();
 
 	GodotProfileZoneGrouped(_profile_zone, "particles_storage->update_particles");
@@ -594,6 +598,11 @@ void RenderingServerDefault::_init() {
 	print_verbose(split_draw ? "Macrame: split draw enabled (render node + submit node)" : "Macrame: split draw disabled");
 	split_render_nodes = OS::get_singleton()->get_environment("MACRAME_RENDER_SPLIT") != "0";
 	lists_lagged = split_render_nodes && OS::get_singleton()->get_environment("MACRAME_RENDER_LAG") != "0";
+	MacrameRunParity::selftest_overlap = OS::get_singleton()->get_environment("MACRAME_PARITY_SELFTEST") == "1";
+	MacrameRunParity::same_run_edge = split_render_nodes && !lists_lagged; // The record node runs after the update by the derived edge.
+	if (MacrameRunParity::selftest_overlap) {
+		print_line("Macrame: MACRAME_PARITY_SELFTEST=1: the record node drains the update node's slot on purpose; the run-parity check must crash.");
+	}
 	print_verbose(split_render_nodes ? (lists_lagged ? "Macrame: render pipeline as scene update + cull + record nodes, record one run behind (versioned lists)" : "Macrame: render pipeline as scene update + cull + record nodes, same run") : "Macrame: single render node");
 	record_guarded.access([](RecordGrantToken &p_token) { MacrameRecord::set_token(&p_token); }).sync();
 	// The scene update never uploads: the node that holds the recording grant does, through
@@ -882,6 +891,13 @@ void RenderingServerDefault::draw(bool p_present, double frame_step) {
 		render_present = p_present;
 		render_step = frame_step;
 		render_slot = int(draw_seq % HANDOFF_SLOTS);
+		// The storages' run boundary: copies for the record node's next run, then the run number
+		// the parity lists key on (nobody reads it while it moves: the run is joined).
+		RSG::utilities->macrame_run_boundary();
+		if (RenderingDevice::get_singleton()) {
+			RenderingDevice::get_singleton()->macrame_run_boundary();
+		}
+		MacrameRunParity::post(draw_seq);
 		post_frame_number = draw_seq;
 		cull_set = int(draw_seq % CULL_SETS); // The parity set the next cull fills: FREE by construction (checked there).
 		if (lists_lagged) {

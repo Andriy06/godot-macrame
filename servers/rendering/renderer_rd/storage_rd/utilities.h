@@ -102,6 +102,8 @@ public:
 	/* MISC */
 
 	virtual void update_dirty_resources() override;
+	virtual void macrame_run_boundary() override;
+	virtual void macrame_update_head() override;
 	virtual void set_debug_generate_wireframes(bool p_generate) override {}
 
 	virtual bool has_os_feature(const String &p_feature) const override;

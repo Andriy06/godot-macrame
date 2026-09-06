@@ -7818,12 +7818,32 @@ bool RenderingDevice::_dependencies_make_mutable(RID p_id, RDG::ResourceTracker 
 
 void RenderingDevice::free_rid(RID p_rid) {
 	ERR_RENDER_THREAD_GUARD();
+#ifdef MACRAME_ENABLED
+	// The self-test skips the deferral so `_free_internal`'s check sees the overlap it forbids.
+	if (!MacrameRunParity::selftest_overlap && macrame_deferred_frees.defer(p_rid)) {
+		return; // The record node frees it next run (`macrame_free_deferred`).
+	}
+#endif
 
 	_free_dependencies(p_rid); // Recursively erase dependencies first, to avoid potential API problems.
 	_free_internal(p_rid);
 }
 
+#ifdef MACRAME_ENABLED
+void RenderingDevice::macrame_free_deferred() {
+	macrame_deferred_frees.apply([this](RID p_rid) {
+		_free_dependencies(p_rid);
+		_free_internal(p_rid);
+	});
+}
+#endif
+
 void RenderingDevice::_free_internal(RID p_id) {
+#ifdef MACRAME_ENABLED
+	// The dispose lists belong to the recording: a free from another node in the same run is the
+	// overlap `macrame_deferred_frees` exists to forbid.
+	CRASH_COND_MSG(MacrameRunParity::defers_frees(), "Macrame: a device object freed by a node without the recording grant (run parity overlap on the dispose lists).");
+#endif
 #ifdef DEV_ENABLED
 	String resource_name;
 	if (resource_names.has(p_id)) {
@@ -9197,6 +9217,9 @@ uint64_t RenderingDevice::limit_get(Limit p_limit) const {
 }
 
 void RenderingDevice::finalize() {
+#ifdef MACRAME_ENABLED
+	macrame_free_deferred(); // The teardown (blue thread) owns both slots.
+#endif
 	ERR_RENDER_THREAD_GUARD();
 
 	if (!frames.is_empty()) {

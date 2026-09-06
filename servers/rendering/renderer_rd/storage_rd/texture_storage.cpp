@@ -3878,6 +3878,13 @@ Dependency *TextureStorage::decal_get_dependency(RID p_decal) {
 }
 
 void TextureStorage::update_decal_atlas() {
+	decal_atlas_requests.apply([this](const DecalAtlasRequest &r) {
+		if (r.add) {
+			_texture_add_to_decal_atlas_now(r.texture, r.panorama_to_dp);
+		} else {
+			_texture_remove_from_decal_atlas_now(r.texture, r.panorama_to_dp);
+		}
+	});
 	CopyEffects *copy_effects = CopyEffects::get_singleton();
 	ERR_FAIL_NULL(copy_effects);
 
@@ -4074,6 +4081,17 @@ void TextureStorage::update_decal_atlas() {
 }
 
 void TextureStorage::texture_add_to_decal_atlas(RID p_texture, bool p_panorama_to_dp) {
+	DecalAtlasRequest r;
+	r.texture = p_texture;
+	r.add = true;
+	r.panorama_to_dp = p_panorama_to_dp;
+	if (decal_atlas_requests.defer(r)) {
+		return;
+	}
+	_texture_add_to_decal_atlas_now(p_texture, p_panorama_to_dp);
+}
+
+void TextureStorage::_texture_add_to_decal_atlas_now(RID p_texture, bool p_panorama_to_dp) {
 	if (!decal_atlas.textures.has(p_texture)) {
 		DecalAtlas::Texture t;
 		t.users = 1;
@@ -4090,6 +4108,17 @@ void TextureStorage::texture_add_to_decal_atlas(RID p_texture, bool p_panorama_t
 }
 
 void TextureStorage::texture_remove_from_decal_atlas(RID p_texture, bool p_panorama_to_dp) {
+	DecalAtlasRequest r;
+	r.texture = p_texture;
+	r.add = false;
+	r.panorama_to_dp = p_panorama_to_dp;
+	if (decal_atlas_requests.defer(r)) {
+		return;
+	}
+	_texture_remove_from_decal_atlas_now(p_texture, p_panorama_to_dp);
+}
+
+void TextureStorage::_texture_remove_from_decal_atlas_now(RID p_texture, bool p_panorama_to_dp) {
 	DecalAtlas::Texture *t = decal_atlas.textures.getptr(p_texture);
 	ERR_FAIL_NULL(t);
 	t->users--;

@@ -33,6 +33,7 @@
 #include "core/templates/local_vector.h"
 #include "core/templates/rid_owner.h"
 #include "core/templates/self_list.h"
+#include "core/macrame/macrame_run_parity.h"
 #include "servers/rendering/renderer_compositor.h"
 #include "servers/rendering/renderer_rd/shaders/skeleton.glsl.gen.h"
 #include "servers/rendering/rendering_server_globals.h"
@@ -197,17 +198,18 @@ private:
 		};
 		LocalVector<Surface> surfaces;
 		LocalVector<float> blend_weights;
+		LocalVector<float> blend_weights_for_upload; // Macrame: the run boundary's copy the record node uploads.
 
 		RID blend_weights_buffer;
 		List<MeshInstance *>::Element *I = nullptr; //used to erase itself
 		uint64_t skeleton_version = 0;
 		bool dirty = false;
 		bool weights_dirty = false;
-		SelfList<MeshInstance> weight_update_list;
-		SelfList<MeshInstance> array_update_list;
+		MacrameParityLinks<MeshInstance> weight_links; // One link per run-parity slot (see macrame_run_parity.h).
+		MacrameParityLinks<MeshInstance> array_links;
 		Transform2D canvas_item_transform_2d;
 		MeshInstance() :
-				weight_update_list(this), array_update_list(this) {}
+				weight_links(this), array_links(this) {}
 	};
 
 	RD::VertexFormatID _mesh_surface_generate_vertex_format(uint64_t p_surface_format, uint64_t p_input_mask, bool p_instanced_surface, bool p_input_motion_vectors, bool p_point_size_emulated, uint32_t &r_position_stride);
@@ -221,8 +223,9 @@ private:
 
 	mutable RID_Owner<MeshInstance> mesh_instance_owner;
 
-	SelfList<MeshInstance>::List dirty_mesh_instance_weights;
-	SelfList<MeshInstance>::List dirty_mesh_instance_arrays;
+	// Macrame: by run parity (see macrame_run_parity.h). The update node queues, the record node processes.
+	MacrameParityList<MeshInstance> dirty_mesh_instance_weights;
+	MacrameParityList<MeshInstance> dirty_mesh_instance_arrays;
 
 	/* MultiMesh */
 
@@ -257,8 +260,12 @@ private:
 		RID uniform_set_2d;
 		RID command_buffer; //used if indirect setting is used
 
-		bool dirty = false;
-		MultiMesh *dirty_list = nullptr;
+		bool dirty[2] = { false, false }; // Per run-parity slot (see macrame_run_parity.h).
+		MultiMesh *dirty_list[2] = { nullptr, nullptr };
+		// Macrame: the run boundary's copy of the data and the dirty regions the record node uploads.
+		Vector<float> upload_data;
+		bool *upload_dirty_regions = nullptr;
+		uint32_t upload_dirty_region_count = 0;
 
 		RendererMeshStorage::MultiMeshInterpolator interpolator;
 
@@ -267,7 +274,22 @@ private:
 
 	mutable RID_Owner<MultiMesh, true> multimesh_owner;
 
-	MultiMesh *multimesh_dirty_list = nullptr;
+	// Macrame: by run parity; the update node marks, the record node uploads (see macrame_run_parity.h).
+	MultiMesh *multimesh_dirty_list[2] = { nullptr, nullptr };
+	uint64_t multimesh_dirty_written[2] = { UINT64_MAX, UINT64_MAX };
+	uint64_t multimesh_record_drained[2] = { UINT64_MAX, UINT64_MAX };
+	void _multimesh_push_dirty(MultiMesh *p_multimesh);
+	void _multimesh_upload(MultiMesh *p_multimesh, int p_slot, bool p_live);
+	MacrameRunFrees<RID> mesh_rid_frees;
+	MacrameRunFrees<RID> mesh_instance_rid_frees;
+	MacrameRunFrees<RID> multimesh_rid_frees;
+	MacrameRunFrees<RID> skeleton_rid_frees;
+	MacrameRunFrees<Mesh::Surface *> surface_frees;
+	void _mesh_free_now(RID p_rid);
+	void _mesh_instance_free_now(RID p_rid);
+	void _multimesh_free_now(RID p_rid);
+	void _skeleton_free_now(RID p_rid);
+	void _surface_free(Mesh::Surface *p_surface);
 
 	_FORCE_INLINE_ void _multimesh_make_local(MultiMesh *multimesh) const;
 	_FORCE_INLINE_ void _multimesh_enable_motion_vectors(MultiMesh *multimesh);
@@ -705,6 +727,9 @@ public:
 	virtual MultiMeshInterpolator *_multimesh_get_interpolator(RID p_multimesh) const override;
 
 	void _update_dirty_multimeshes();
+	void macrame_run_boundary();
+	void macrame_update_head();
+	void macrame_apply_deferred_frees(bool p_all = false);
 	void _multimesh_get_motion_vectors_offsets(RID p_multimesh, uint32_t &r_current_offset, uint32_t &r_prev_offset);
 	bool _multimesh_uses_motion_vectors_offsets(RID p_multimesh);
 	bool _multimesh_uses_motion_vectors(RID p_multimesh);

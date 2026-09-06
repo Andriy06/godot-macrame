@@ -260,6 +260,17 @@ void Utilities::update_dirty_resources() {
 	TextureStorage::get_singleton()->update_area_light_atlas();
 }
 
+void Utilities::macrame_run_boundary() {
+	MaterialStorage::get_singleton()->macrame_run_boundary();
+	MeshStorage::get_singleton()->macrame_run_boundary();
+	TextureStorage::get_singleton()->macrame_run_boundary();
+}
+
+void Utilities::macrame_update_head() {
+	MaterialStorage::get_singleton()->macrame_update_head();
+	MeshStorage::get_singleton()->macrame_update_head();
+}
+
 bool Utilities::has_os_feature(const String &p_feature) const {
 	if (!RD::get_singleton()) {
 		return false;

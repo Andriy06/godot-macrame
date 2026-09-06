@@ -48,6 +48,7 @@
 
 #ifdef MACRAME_ENABLED
 #include "core/macrame/macrame_render_grant.h"
+#include "core/macrame/macrame_run_parity.h"
 #include "ts/guarded.h"
 #include "ts/rules.h"
 #endif
@@ -2003,6 +2004,13 @@ public:
 	void _set_max_fps(int p_max_fps);
 
 	void free_rid(RID p_rid);
+#ifdef MACRAME_ENABLED
+	// A free from a node without the recording grant (the scene update's journal) waits for the
+	// record node: the dispose lists are the recording's. Applied under the recording grant.
+	MacrameParityFrees<RID> macrame_deferred_frees;
+	void macrame_free_deferred();
+	void macrame_run_boundary() { macrame_deferred_frees.check_boundary("device frees"); }
+#endif
 	void texture_replace_rid(RID p_old_texture, RID p_new_texture);
 #ifndef DISABLE_DEPRECATED
 	[[deprecated("Use `free_rid()` instead.")]] void free(RID p_rid) {

@@ -31,6 +31,7 @@
 #pragma once
 
 #include "core/templates/paged_array.h"
+#include "core/macrame/macrame_run_parity.h"
 #include "core/templates/rid_owner.h"
 #include "servers/rendering/renderer_rd/shaders/canvas_sdf.glsl.gen.h"
 #include "servers/rendering/renderer_rd/shaders/tex_blit.glsl.gen.h"
@@ -708,6 +709,16 @@ public:
 	/* DECAL API */
 
 	void update_decal_atlas();
+	// Macrame: a request from the update node waits for the record node (the atlas is the record's).
+	struct DecalAtlasRequest {
+		RID texture;
+		bool add = false;
+		bool panorama_to_dp = false;
+	};
+	MacrameParityFrees<DecalAtlasRequest> decal_atlas_requests;
+	void macrame_run_boundary() { decal_atlas_requests.check_boundary("decal atlas requests"); }
+	void _texture_add_to_decal_atlas_now(RID p_texture, bool p_panorama_to_dp);
+	void _texture_remove_from_decal_atlas_now(RID p_texture, bool p_panorama_to_dp);
 
 	bool owns_decal(RID p_rid) const { return decal_owner.owns(p_rid); }
 

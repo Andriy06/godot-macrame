@@ -32,6 +32,7 @@
 
 #include "core/templates/rid_owner.h"
 #include "core/templates/self_list.h"
+#include "core/macrame/macrame_run_parity.h"
 #include "servers/rendering/renderer_rd/pipeline_cache_rd.h"
 #include "servers/rendering/renderer_rd/storage_rd/texture_storage.h"
 #include "servers/rendering/rendering_server_types.h"
@@ -298,22 +299,27 @@ private:
 		bool uniform_dirty = false;
 		bool texture_dirty = false;
 		HashMap<StringName, Variant> params;
+		HashMap<StringName, Variant> params_for_update; // Macrame: the run boundary's copy, what the record node's update reads.
 		int32_t priority = 0;
 		RID next_pass;
-		SelfList<Material> update_element;
+		MacrameParityLinks<Material> update_links; // One link per run-parity slot (see macrame_run_parity.h).
 
 		Dependency dependency;
 
 		Material() :
-				update_element(this) {}
+				update_links(this) {}
 	};
 
 	MaterialDataRequestFunction material_data_request_func[SHADER_TYPE_MAX];
 	mutable RID_Owner<Material, true> material_owner;
 	Material *get_material(RID p_rid) { return material_owner.get_or_null(p_rid); }
 
-	SelfList<Material>::List material_update_list;
-	Mutex material_update_list_mutex;
+	// Macrame: by run parity; the update node queues, the record node updates (see macrame_run_parity.h).
+	MacrameParityList<Material> material_update_list;
+	MacrameRunFrees<MaterialData *> material_data_frees; // A draw of this run may still name it.
+	MacrameRunFrees<RID> material_rid_frees; // The struct stays until no run names it.
+	void _material_free_data(MaterialData *p_data);
+	void _material_apply_deferred_frees(bool p_all = false);
 
 	static void _material_uniform_set_erased(void *p_material);
 
@@ -487,6 +493,8 @@ public:
 
 	void _material_queue_update(Material *material, bool p_uniform, bool p_texture);
 	void _update_queued_materials();
+	void macrame_run_boundary();
+	void macrame_update_head();
 
 	virtual RID material_allocate() override;
 	virtual void material_initialize(RID p_material) override;

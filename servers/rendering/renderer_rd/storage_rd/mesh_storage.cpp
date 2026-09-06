@@ -188,6 +188,7 @@ MeshStorage::MeshStorage() {
 }
 
 MeshStorage::~MeshStorage() {
+	macrame_apply_deferred_frees(true); // The teardown owns everything.
 	//def buffers
 	for (int i = 0; i < DEFAULT_RD_BUFFER_MAX; i++) {
 		RD::get_singleton()->free_rid(mesh_default_rd_buffers[i]);
@@ -245,6 +246,13 @@ void MeshStorage::mesh_free(RID p_rid) {
 			shadow_owner->dependency.changed_notify(Dependency::DEPENDENCY_CHANGED_MESH);
 		}
 	}
+	if (mesh_rid_frees.defer(p_rid)) {
+		return; // The struct goes when no run names it (the record node, next run).
+	}
+	_mesh_free_now(p_rid);
+}
+
+void MeshStorage::_mesh_free_now(RID p_rid) {
 	mesh_owner.free(p_rid);
 }
 
@@ -528,10 +536,6 @@ void MeshStorage::_mesh_surface_clear(Mesh *p_mesh, int p_surface) {
 	if (s.skin_buffer.is_valid()) {
 		RD::get_singleton()->free_rid(s.skin_buffer);
 	}
-	if (s.versions) {
-		memfree(s.versions); // reallocs, so free with memfree.
-	}
-
 	if (s.index_buffer.is_valid()) {
 		RD::get_singleton()->free_rid(s.index_buffer);
 	}
@@ -540,14 +544,15 @@ void MeshStorage::_mesh_surface_clear(Mesh *p_mesh, int p_surface) {
 		for (uint32_t j = 0; j < s.lod_count; j++) {
 			RD::get_singleton()->free_rid(s.lods[j].index_buffer);
 		}
-		memdelete_arr(s.lods);
 	}
 
 	if (s.blend_shape_buffer.is_valid()) {
 		RD::get_singleton()->free_rid(s.blend_shape_buffer);
 	}
 
-	memdelete(p_mesh->surfaces[p_surface]);
+	// The struct, its vertex arrays and its lods: a surface cache the record node draws with this
+	// run names them (deferred by run parity from the update node).
+	_surface_free(p_mesh->surfaces[p_surface]);
 }
 
 int MeshStorage::mesh_get_blend_shape_count(RID p_mesh) const {
@@ -1038,10 +1043,20 @@ RID MeshStorage::mesh_instance_create(RID p_base) {
 
 void MeshStorage::mesh_instance_free(RID p_rid) {
 	MeshInstance *mi = mesh_instance_owner.get_or_null(p_rid);
-	_mesh_instance_clear(mi);
-	mi->mesh->instances.erase(mi->I);
+	mi->mesh->instances.erase(mi->I); // The mesh's list is the update node's.
 	mi->I = nullptr;
+	if (mesh_instance_rid_frees.defer(p_rid)) {
+		return; // Its buffers and its place in the dirty lists: the record node's, next run.
+	}
+	_mesh_instance_free_now(p_rid);
+}
 
+void MeshStorage::_mesh_instance_free_now(RID p_rid) {
+	MeshInstance *mi = mesh_instance_owner.get_or_null(p_rid);
+	ERR_FAIL_NULL(mi);
+	MacrameParityList<MeshInstance>::remove(mi->weight_links);
+	MacrameParityList<MeshInstance>::remove(mi->array_links);
+	_mesh_instance_clear(mi);
 	mesh_instance_owner.free(p_rid);
 }
 
@@ -1150,12 +1165,12 @@ void MeshStorage::mesh_instance_check_for_update(RID p_mesh_instance) {
 
 	bool needs_update = mi->dirty;
 
-	if (mi->weights_dirty && !mi->weight_update_list.in_list()) {
-		dirty_mesh_instance_weights.add(&mi->weight_update_list);
+	if (mi->weights_dirty && !MacrameParityList<MeshInstance>::queued(mi->weight_links)) {
+		dirty_mesh_instance_weights.add(mi->weight_links);
 		needs_update = true;
 	}
 
-	if (mi->array_update_list.in_list()) {
+	if (MacrameParityList<MeshInstance>::queued(mi->array_links)) {
 		return;
 	}
 
@@ -1167,7 +1182,7 @@ void MeshStorage::mesh_instance_check_for_update(RID p_mesh_instance) {
 	}
 
 	if (needs_update) {
-		dirty_mesh_instance_arrays.add(&mi->array_update_list);
+		dirty_mesh_instance_arrays.add(mi->array_links);
 	}
 }
 
@@ -1177,17 +1192,23 @@ void MeshStorage::mesh_instance_set_canvas_item_transform(RID p_mesh_instance, c
 }
 
 void MeshStorage::update_mesh_instances() {
-	while (dirty_mesh_instance_weights.first()) {
-		MeshInstance *mi = dirty_mesh_instance_weights.first()->self();
-
-		if (mi->blend_weights_buffer.is_valid()) {
-			RD::get_singleton()->buffer_update(mi->blend_weights_buffer, 0, mi->blend_weights.size() * sizeof(float), mi->blend_weights.ptr());
+	dirty_mesh_instance_weights.drain([](MeshInstance *mi, bool p_live) {
+		if (p_live) {
+			mi->blend_weights_for_upload = mi->blend_weights;
 		}
-		dirty_mesh_instance_weights.remove(&mi->weight_update_list);
+		if (mi->blend_weights_buffer.is_valid()) {
+			RD::get_singleton()->buffer_update(mi->blend_weights_buffer, 0, mi->blend_weights_for_upload.size() * sizeof(float), mi->blend_weights_for_upload.ptr());
+		}
 		mi->weights_dirty = false;
-	}
-	if (dirty_mesh_instance_arrays.first() == nullptr) {
+	});
+	if (!dirty_mesh_instance_arrays.has_pending()) {
 		return; //nothing to do
+	}
+	// The instances this run may process (the slots are the hand-off, this is the work list).
+	LocalVector<MeshInstance *> arrays_to_update;
+	dirty_mesh_instance_arrays.drain([&arrays_to_update](MeshInstance *mi, bool) { arrays_to_update.push_back(mi); });
+	if (arrays_to_update.is_empty()) {
+		return;
 	}
 
 	//process skeletons and blend shapes
@@ -1195,8 +1216,7 @@ void MeshStorage::update_mesh_instances() {
 	bool uses_motion_vectors = (RSG::viewport->get_num_viewports_with_motion_vectors() > 0) || (RendererCompositorStorage::get_singleton()->get_num_compositor_effects_with_motion_vectors() > 0);
 	RD::ComputeListID compute_list = RD::get_singleton()->compute_list_begin();
 
-	while (dirty_mesh_instance_arrays.first()) {
-		MeshInstance *mi = dirty_mesh_instance_arrays.first()->self();
+	for (MeshInstance *mi : arrays_to_update) {
 
 		Skeleton *sk = skeleton_owner.get_or_null(mi->skeleton);
 
@@ -1287,7 +1307,6 @@ void MeshStorage::update_mesh_instances() {
 		if (sk) {
 			mi->skeleton_version = sk->version;
 		}
-		dirty_mesh_instance_arrays.remove(&mi->array_update_list);
 	}
 
 	RD::get_singleton()->compute_list_end();
@@ -1565,12 +1584,18 @@ void MeshStorage::_multimesh_initialize(RID p_rid) {
 }
 
 void MeshStorage::_multimesh_free(RID p_rid) {
-	// Remove from interpolator.
-	_interpolation_data.notify_free_multimesh(p_rid);
-	_update_dirty_multimeshes();
-	multimesh_allocate_data(p_rid, 0, RSE::MULTIMESH_TRANSFORM_2D);
 	MultiMesh *multimesh = multimesh_owner.get_or_null(p_rid);
+	ERR_FAIL_NULL(multimesh);
 	multimesh->dependency.deleted_notify(p_rid);
+	if (multimesh_rid_frees.defer(p_rid)) {
+		return; // Its data and its dirty-list place: the record node's, once uploaded (next run).
+	}
+	_multimesh_free_now(p_rid);
+}
+
+void MeshStorage::_multimesh_free_now(RID p_rid) {
+	// Two runs after the free: the record node uploaded and unlinked it in between.
+	multimesh_allocate_data(p_rid, 0, RSE::MULTIMESH_TRANSFORM_2D);
 	multimesh_owner.free(p_rid);
 }
 
@@ -1591,6 +1616,10 @@ void MeshStorage::_multimesh_allocate_data(RID p_multimesh, int p_instances, RSE
 
 	if (multimesh->data_cache_dirty_regions) {
 		memdelete_arr(multimesh->data_cache_dirty_regions);
+		if (multimesh->upload_dirty_regions) {
+			memdelete_arr(multimesh->upload_dirty_regions);
+			multimesh->upload_dirty_regions = nullptr;
+		}
 		multimesh->data_cache_dirty_regions = nullptr;
 		multimesh->data_cache_dirty_region_count = 0;
 	}
@@ -1776,6 +1805,9 @@ void MeshStorage::_multimesh_make_local(MultiMesh *multimesh) const {
 	}
 	uint32_t data_cache_dirty_region_count = Math::division_round_up(multimesh->instances, MULTIMESH_DIRTY_REGION_SIZE);
 	multimesh->data_cache_dirty_regions = memnew_arr(bool, data_cache_dirty_region_count);
+	multimesh->upload_dirty_regions = memnew_arr(bool, data_cache_dirty_region_count);
+	memset(multimesh->upload_dirty_regions, 0, data_cache_dirty_region_count * sizeof(bool));
+	multimesh->upload_dirty_region_count = 0;
 	memset(multimesh->data_cache_dirty_regions, 0, data_cache_dirty_region_count * sizeof(bool));
 	multimesh->data_cache_dirty_region_count = 0;
 
@@ -1834,11 +1866,7 @@ void MeshStorage::_multimesh_mark_dirty(MultiMesh *multimesh, int p_index, bool 
 		multimesh->aabb_dirty = true;
 	}
 
-	if (!multimesh->dirty) {
-		multimesh->dirty_list = multimesh_dirty_list;
-		multimesh_dirty_list = multimesh;
-		multimesh->dirty = true;
-	}
+	_multimesh_push_dirty(multimesh);
 }
 
 void MeshStorage::_multimesh_mark_all_dirty(MultiMesh *multimesh, bool p_data, bool p_aabb) {
@@ -1857,11 +1885,7 @@ void MeshStorage::_multimesh_mark_all_dirty(MultiMesh *multimesh, bool p_data, b
 		multimesh->aabb_dirty = true;
 	}
 
-	if (!multimesh->dirty) {
-		multimesh->dirty_list = multimesh_dirty_list;
-		multimesh_dirty_list = multimesh;
-		multimesh->dirty = true;
-	}
+	_multimesh_push_dirty(multimesh);
 }
 
 void MeshStorage::_multimesh_re_create_aabb(MultiMesh *multimesh, const float *p_data, int p_instances) {
@@ -2286,61 +2310,156 @@ MeshStorage::MultiMeshInterpolator *MeshStorage::_multimesh_get_interpolator(RID
 	return &multimesh->interpolator;
 }
 
-void MeshStorage::_update_dirty_multimeshes() {
-	while (multimesh_dirty_list) {
-		MultiMesh *multimesh = multimesh_dirty_list;
+void MeshStorage::_multimesh_push_dirty(MultiMesh *p_multimesh) {
+	const int w = MacrameRunParity::add_slot();
+	if (p_multimesh->dirty[w]) {
+		return;
+	}
+	if (!MacrameRunParity::on_record_node()) {
+		multimesh_dirty_written[w] = MacrameRunParity::current();
+	}
+	p_multimesh->dirty_list[w] = multimesh_dirty_list[w];
+	multimesh_dirty_list[w] = p_multimesh;
+	p_multimesh->dirty[w] = true;
+}
 
-		if (multimesh->data_cache.size()) { //may have been cleared, so only process if it exists
-
-			uint32_t visible_instances = multimesh->visible_instances >= 0 ? multimesh->visible_instances : multimesh->instances;
-			uint32_t buffer_offset = multimesh->motion_vectors_current_offset * multimesh->stride_cache;
-			const float *data = multimesh->data_cache.ptr() + buffer_offset;
-
-			uint32_t total_dirty_regions = multimesh->data_cache_dirty_region_count + multimesh->previous_data_cache_dirty_region_count;
-			if (total_dirty_regions != 0) {
-				uint32_t data_cache_dirty_region_count = Math::division_round_up(multimesh->instances, (int)MULTIMESH_DIRTY_REGION_SIZE);
-				uint32_t visible_region_count = visible_instances == 0 ? 0 : Math::division_round_up(visible_instances, (uint32_t)MULTIMESH_DIRTY_REGION_SIZE);
-
-				uint32_t region_size = multimesh->stride_cache * MULTIMESH_DIRTY_REGION_SIZE * sizeof(float);
-				if (total_dirty_regions > 32 || total_dirty_regions > visible_region_count / 2) {
-					//if there too many dirty regions, or represent the majority of regions, just copy all, else transfer cost piles up too much
-					RD::get_singleton()->buffer_update(multimesh->buffer, buffer_offset * sizeof(float), MIN(visible_region_count * region_size, multimesh->instances * (uint32_t)multimesh->stride_cache * (uint32_t)sizeof(float)), data);
-				} else {
-					//not that many regions? update them all
-					for (uint32_t i = 0; i < visible_region_count; i++) {
-						if (multimesh->data_cache_dirty_regions[i] || multimesh->previous_data_cache_dirty_regions[i]) {
-							uint32_t offset = i * region_size;
-							uint32_t size = multimesh->stride_cache * (uint32_t)multimesh->instances * (uint32_t)sizeof(float);
-							uint32_t region_start_index = multimesh->stride_cache * MULTIMESH_DIRTY_REGION_SIZE * i;
-							RD::get_singleton()->buffer_update(multimesh->buffer, buffer_offset * sizeof(float) + offset, MIN(region_size, size - offset), &data[region_start_index]);
-						}
-					}
-				}
-
-				memcpy(multimesh->previous_data_cache_dirty_regions, multimesh->data_cache_dirty_regions, data_cache_dirty_region_count * sizeof(bool));
-				memset(multimesh->data_cache_dirty_regions, 0, data_cache_dirty_region_count * sizeof(bool));
-
-				multimesh->previous_data_cache_dirty_region_count = multimesh->data_cache_dirty_region_count;
-				multimesh->data_cache_dirty_region_count = 0;
-			}
-
-			if (multimesh->aabb_dirty) {
-				//aabb is dirty..
-				multimesh->aabb_dirty = false;
-				if (multimesh->custom_aabb == AABB()) {
-					_multimesh_re_create_aabb(multimesh, data, visible_instances);
-					multimesh->dependency.changed_notify(Dependency::DEPENDENCY_CHANGED_AABB);
-				}
-			}
+void MeshStorage::_multimesh_upload(MultiMesh *multimesh, int p_slot, bool p_live) {
+	if (multimesh->data_cache.size()) { //may have been cleared, so only process if it exists
+		if (p_live) {
+			// No run boundary copied it: no overlap possible either (the single node, the sync draw).
+			multimesh->upload_data = multimesh->data_cache;
+			uint32_t data_cache_dirty_region_count = Math::division_round_up(multimesh->instances, MULTIMESH_DIRTY_REGION_SIZE);
+			memcpy(multimesh->upload_dirty_regions, multimesh->data_cache_dirty_regions, data_cache_dirty_region_count * sizeof(bool));
+			memset(multimesh->data_cache_dirty_regions, 0, data_cache_dirty_region_count * sizeof(bool));
+			multimesh->upload_dirty_region_count = multimesh->data_cache_dirty_region_count;
+			multimesh->data_cache_dirty_region_count = 0;
 		}
 
-		multimesh_dirty_list = multimesh->dirty_list;
+		uint32_t visible_instances = multimesh->visible_instances >= 0 ? multimesh->visible_instances : multimesh->instances;
+		uint32_t buffer_offset = multimesh->motion_vectors_current_offset * multimesh->stride_cache;
+		const float *data = multimesh->upload_data.ptr() + buffer_offset;
 
-		multimesh->dirty_list = nullptr;
-		multimesh->dirty = false;
+		uint32_t total_dirty_regions = multimesh->upload_dirty_region_count + multimesh->previous_data_cache_dirty_region_count;
+		if (total_dirty_regions != 0) {
+			uint32_t data_cache_dirty_region_count = Math::division_round_up(multimesh->instances, (int)MULTIMESH_DIRTY_REGION_SIZE);
+			uint32_t visible_region_count = visible_instances == 0 ? 0 : Math::division_round_up(visible_instances, (uint32_t)MULTIMESH_DIRTY_REGION_SIZE);
+
+			uint32_t region_size = multimesh->stride_cache * MULTIMESH_DIRTY_REGION_SIZE * sizeof(float);
+			if (total_dirty_regions > 32 || total_dirty_regions > visible_region_count / 2) {
+				//if there too many dirty regions, or represent the majority of regions, just copy all, else transfer cost piles up too much
+				RD::get_singleton()->buffer_update(multimesh->buffer, buffer_offset * sizeof(float), MIN(visible_region_count * region_size, multimesh->instances * (uint32_t)multimesh->stride_cache * (uint32_t)sizeof(float)), data);
+			} else {
+				//not that many regions? update them all
+				for (uint32_t i = 0; i < visible_region_count; i++) {
+					if (multimesh->upload_dirty_regions[i] || multimesh->previous_data_cache_dirty_regions[i]) {
+						uint32_t offset = i * region_size;
+						uint32_t size = multimesh->stride_cache * (uint32_t)multimesh->instances * (uint32_t)sizeof(float);
+						uint32_t region_start_index = multimesh->stride_cache * MULTIMESH_DIRTY_REGION_SIZE * i;
+						RD::get_singleton()->buffer_update(multimesh->buffer, buffer_offset * sizeof(float) + offset, MIN(region_size, size - offset), &data[region_start_index]);
+					}
+				}
+			}
+
+			memcpy(multimesh->previous_data_cache_dirty_regions, multimesh->upload_dirty_regions, data_cache_dirty_region_count * sizeof(bool));
+			memset(multimesh->upload_dirty_regions, 0, data_cache_dirty_region_count * sizeof(bool));
+
+			multimesh->previous_data_cache_dirty_region_count = multimesh->upload_dirty_region_count;
+			multimesh->upload_dirty_region_count = 0;
+		}
+		// The AABB is the update node's (`macrame_update_head`), not the record's.
 	}
+	multimesh->dirty_list[p_slot] = nullptr;
+	multimesh->dirty[p_slot] = false;
+}
 
-	multimesh_dirty_list = nullptr;
+void MeshStorage::_update_dirty_multimeshes() {
+	const int d = MacrameRunParity::drain_slot();
+	if (MacrameRunParity::stamps_drain()) {
+		multimesh_record_drained[d] = MacrameRunParity::current();
+	}
+	while (multimesh_dirty_list[d]) {
+		MultiMesh *multimesh = multimesh_dirty_list[d];
+		multimesh_dirty_list[d] = multimesh->dirty_list[d];
+		_multimesh_upload(multimesh, d, false);
+	}
+	if (MacrameRunParity::drains_both()) {
+		const int w = MacrameRunParity::write_slot();
+		while (multimesh_dirty_list[w]) {
+			MultiMesh *multimesh = multimesh_dirty_list[w];
+			multimesh_dirty_list[w] = multimesh->dirty_list[w];
+			_multimesh_upload(multimesh, w, true);
+		}
+	}
+}
+
+void MeshStorage::macrame_run_boundary() {
+	dirty_mesh_instance_weights.check_boundary("mesh instance blend weights");
+	dirty_mesh_instance_arrays.check_boundary("mesh instance arrays");
+	MacrameRunParity::check_boundary(multimesh_dirty_written, multimesh_record_drained, "dirty multimeshes");
+	// The blue thread, between runs: what the update node queued this run, copied for the record
+	// node's upload next run (a reference; the update node's next write copies on write).
+	dirty_mesh_instance_weights.for_each_written([](MeshInstance *mi) {
+		mi->blend_weights_for_upload = mi->blend_weights;
+	});
+	const int w = MacrameRunParity::write_slot();
+	for (MultiMesh *multimesh = multimesh_dirty_list[w]; multimesh; multimesh = multimesh->dirty_list[w]) {
+		if (multimesh->data_cache.size() && multimesh->upload_dirty_regions) {
+			multimesh->upload_data = multimesh->data_cache;
+			uint32_t data_cache_dirty_region_count = Math::division_round_up(multimesh->instances, MULTIMESH_DIRTY_REGION_SIZE);
+			memcpy(multimesh->upload_dirty_regions, multimesh->data_cache_dirty_regions, data_cache_dirty_region_count * sizeof(bool));
+			memset(multimesh->data_cache_dirty_regions, 0, data_cache_dirty_region_count * sizeof(bool));
+			multimesh->upload_dirty_region_count = multimesh->data_cache_dirty_region_count;
+			multimesh->data_cache_dirty_region_count = 0;
+		}
+	}
+}
+
+void MeshStorage::macrame_update_head() {
+	// The update node, before the dirty instances. First what it freed two runs ago (no run names
+	// it any more), then the AABB of every multimesh the journal changed this run, from the live
+	// data (the record node only uploads).
+	macrame_apply_deferred_frees();
+	const int w = MacrameRunParity::write_slot();
+	for (MultiMesh *multimesh = multimesh_dirty_list[w]; multimesh; multimesh = multimesh->dirty_list[w]) {
+		if (multimesh->aabb_dirty && multimesh->data_cache.size()) {
+			multimesh->aabb_dirty = false;
+			if (multimesh->custom_aabb == AABB()) {
+				uint32_t visible_instances = multimesh->visible_instances >= 0 ? multimesh->visible_instances : multimesh->instances;
+				const float *data = multimesh->data_cache.ptr() + multimesh->motion_vectors_current_offset * multimesh->stride_cache;
+				_multimesh_re_create_aabb(multimesh, data, visible_instances);
+				multimesh->dependency.changed_notify(Dependency::DEPENDENCY_CHANGED_AABB);
+			}
+		}
+	}
+}
+
+void MeshStorage::macrame_apply_deferred_frees(bool p_all) {
+	surface_frees.apply([](Mesh::Surface *p_surface) {
+		if (p_surface->versions) {
+			memfree(p_surface->versions);
+		}
+		if (p_surface->lod_count) {
+			memdelete_arr(p_surface->lods);
+		}
+		memdelete(p_surface);
+	}, p_all);
+	mesh_rid_frees.apply([this](RID p_rid) { _mesh_free_now(p_rid); }, p_all);
+	mesh_instance_rid_frees.apply([this](RID p_rid) { _mesh_instance_free_now(p_rid); }, p_all);
+	multimesh_rid_frees.apply([this](RID p_rid) { _multimesh_free_now(p_rid); }, p_all);
+	skeleton_rid_frees.apply([this](RID p_rid) { _skeleton_free_now(p_rid); }, p_all);
+}
+
+void MeshStorage::_surface_free(Mesh::Surface *p_surface) {
+	if (surface_frees.defer(p_surface)) {
+		return;
+	}
+	if (p_surface->versions) {
+		memfree(p_surface->versions); // reallocs, so free with memfree.
+	}
+	if (p_surface->lod_count) {
+		memdelete_arr(p_surface->lods);
+	}
+	memdelete(p_surface);
 }
 
 /* SKELETON API */
@@ -2353,10 +2472,17 @@ void MeshStorage::skeleton_initialize(RID p_rid) {
 }
 
 void MeshStorage::skeleton_free(RID p_rid) {
-	_update_dirty_skeletons();
-	skeleton_allocate_data(p_rid, 0);
 	Skeleton *skeleton = skeleton_owner.get_or_null(p_rid);
+	ERR_FAIL_NULL(skeleton);
 	skeleton->dependency.deleted_notify(p_rid);
+	if (skeleton_rid_frees.defer(p_rid)) {
+		return; // Its buffer and its ring slots: the record node's, after the frame's upload (next run).
+	}
+	_skeleton_free_now(p_rid);
+}
+
+void MeshStorage::_skeleton_free_now(RID p_rid) {
+	skeleton_allocate_data(p_rid, 0);
 	skeleton_owner.free(p_rid);
 }
 

@@ -34,6 +34,7 @@
 #include "core/config/project_settings.h"
 #include "core/macrame/macrame_phase_probe.h"
 #include "core/macrame/macrame_render_grant.h"
+#include "core/macrame/macrame_run_parity.h"
 #include "core/profiling/profiling.h" // [perf-zones]
 #include "core/math/geometry_3d.h"
 #include "core/object/callable_mp.h"
@@ -4609,6 +4610,14 @@ void RendererSceneCull::update_dirty_instances() const {
 	}
 
 	MACRAME_PHASE("su: dirty instances");
+#ifdef MACRAME_ENABLED
+	if (macrame_defer_device_update && ts::current_worker_index() >= 0 && !MacrameRecord::holds_grant()) {
+		// The update node (a free, a query): the uploads are the record node's
+		// (`macrame_device_update`). Found by the harness with the churn knob: the journal's free
+		// of an instance flushed the queued materials into the device from here.
+		return;
+	}
+#endif
 	// Update dirty resources after dirty instances as instance updates may affect resources.
 	RSG::utilities->update_dirty_resources();
 	MACRAME_PHASE("su: dirty resources (uploads)");
@@ -4630,7 +4639,9 @@ void RendererSceneCull::update() {
 	MACRAME_PHASE("su: sky + pipeline requirements");
 	if (macrame_defer_device_update) {
 		// The record node calls `macrame_device_update()` for the uploads and the collider
-		// renders; here only the CPU side. First what the record node deferred last run.
+		// renders; here only the CPU side. First what the update owns of the dirty resources (the
+		// multimesh AABBs), then what the record node deferred last run.
+		RSG::utilities->macrame_update_head();
 		LocalVector<DeferredInstanceUpdate> &deferred = deferred_instance_updates[deferred_write ^ 1];
 		for (const DeferredInstanceUpdate &d : deferred) {
 			Instance *instance = instance_owner.get_or_null(d.instance);
