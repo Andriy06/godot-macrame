@@ -240,6 +240,13 @@ opts.Add(
         True,
     )
 )
+opts.Add(
+    BoolVariable(
+        "profiler_localhost",
+        "Bind the profiler's listener to the loopback interface only and skip the discovery broadcast (Tracy: TRACY_ONLY_LOCALHOST + TRACY_NO_BROADCAST). Keeps Windows Firewall from prompting for every new binary; the viewer connects to 127.0.0.1.",
+        True,
+    )
+)
 
 
 # Advanced options

@@ -75,6 +75,10 @@ if env["profiler"]:
             env_tracy.Append(CPPDEFINES=["GODOT_PROFILER_TRACK_MEMORY"])
         if env["profiler_record_on_demand"]:
             env_tracy.Append(CPPDEFINES=["TRACY_ON_DEMAND"])
+        if env["profiler_localhost"]:
+            # Only TracyClient.cpp sees these: the listener binds 127.0.0.1 and the UDP discovery
+            # broadcast is compiled out, so a fresh binary path never trips the firewall prompt.
+            env_tracy.Append(CPPDEFINES=["TRACY_ONLY_LOCALHOST", "TRACY_NO_BROADCAST"])
         env_tracy.disable_warnings()
         env_tracy.add_source_files(env.core_sources, str((profiler_path / "TracyClient.cpp").absolute()))
     elif env["profiler"] == "perfetto":
