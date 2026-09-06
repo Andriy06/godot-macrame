@@ -2916,6 +2916,12 @@ void RendererSceneCull::macrame_before_renderer_free() {
 		scene_render->frame_data_free(scratch_frame->render_lists);
 		scratch_frame->render_lists = nullptr;
 	}
+	if (scratch_frame) {
+		// The scratch frame's copy of the last drawn viewport's buffers: dropped here, before the
+		// storages go, or the buffers' textures outlive the framebuffer cache ("3 framebuffer cache
+		// instance(s) still in use" at exit).
+		scratch_frame->render_buffers.unref();
+	}
 	scene_render = nullptr;
 }
 
@@ -4641,6 +4647,9 @@ void RendererSceneCull::update() {
 		// The record node calls `macrame_device_update()` for the uploads and the collider
 		// renders; here only the CPU side. First what the update owns of the dirty resources (the
 		// multimesh AABBs), then what the record node deferred last run.
+		MacrameDeferredNotify::drain([](Dependency *p_dependency, int p_notification) {
+			p_dependency->changed_notify(Dependency::DependencyChangedNotification(p_notification));
+		});
 		RSG::utilities->macrame_update_head();
 		LocalVector<DeferredInstanceUpdate> &deferred = deferred_instance_updates[deferred_write ^ 1];
 		for (const DeferredInstanceUpdate &d : deferred) {

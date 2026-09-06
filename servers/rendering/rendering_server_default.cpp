@@ -894,6 +894,7 @@ void RenderingServerDefault::draw(bool p_present, double frame_step) {
 		// The storages' run boundary: copies for the record node's next run, then the run number
 		// the parity lists key on (nobody reads it while it moves: the run is joined).
 		RSG::utilities->macrame_run_boundary();
+		MacrameDeferredNotify::check_boundary();
 		if (RenderingDevice::get_singleton()) {
 			RenderingDevice::get_singleton()->macrame_run_boundary();
 		}

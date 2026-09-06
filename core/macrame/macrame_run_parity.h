@@ -35,6 +35,7 @@
 #include "core/error/error_macros.h"
 #include "core/string/ustring.h"
 #include "core/macrame/macrame_render_grant.h"
+#include "core/templates/hash_set.h"
 #include "core/templates/local_vector.h"
 #include "core/templates/self_list.h"
 
@@ -91,6 +92,51 @@ struct MacrameRunParity {
 	static void check_boundary(const uint64_t *p_update_written, const uint64_t *p_record_drained, const char *p_what) {
 		for (int slot = 0; slot < 2; slot++) {
 			CRASH_COND_MSG(p_update_written[slot] == run && p_record_drained[slot] == run, String("Macrame: ") + p_what + ": the scene update wrote and the record node drained the same run-parity slot in run " + itos(run) + " (run parity overlap).");
+		}
+	}
+};
+
+// Dependency notifications raised by the record node (a material's uniform set recreated on
+// upload, a particle system's AABB after its process) walk `Dependency::instances`, a hash map the
+// scene update mutates (instances change base, are freed). The walk is the update node's: the
+// record node files the notification here, in the slot of its run, and the next scene update
+// drains the other slot at its head and walks under the render grant. A dependency freed before
+// the drain is skipped by serial: the storages' deferred frees keep the struct alive one run, the
+// serial registry (the update node's, and the blue thread's between runs) says whether it is.
+struct MacrameDeferredNotify {
+	struct Entry {
+		class Dependency *dependency;
+		uint64_t serial;
+		int notification;
+	};
+	static inline LocalVector<Entry> slots[2];
+	static inline uint64_t record_wrote[2] = { UINT64_MAX, UINT64_MAX };
+	static inline uint64_t update_drained[2] = { UINT64_MAX, UINT64_MAX };
+	static inline HashSet<uint64_t> live; // Serials of the dependencies alive.
+	static inline uint64_t next_serial = 1;
+
+	// The record node, in its run.
+	static void add(class Dependency *p_dependency, uint64_t p_serial, int p_notification) {
+		const int s = int(MacrameRunParity::current() & 1);
+		record_wrote[s] = MacrameRunParity::current();
+		slots[s].push_back({ p_dependency, p_serial, p_notification });
+	}
+	// The scene update, at its head: what the record node of the previous run filed.
+	template <class F>
+	static void drain(F &&p_each) {
+		const int s = int(MacrameRunParity::current() & 1) ^ 1;
+		update_drained[s] = MacrameRunParity::current();
+		for (const Entry &e : slots[s]) {
+			if (live.has(e.serial)) {
+				p_each(e.dependency, e.notification);
+			}
+		}
+		slots[s].clear();
+	}
+	// The blue thread, at the run boundary: both sides of one slot in one run is the overlap.
+	static void check_boundary() {
+		for (int slot = 0; slot < 2; slot++) {
+			CRASH_COND_MSG(record_wrote[slot] == MacrameRunParity::run && update_drained[slot] == MacrameRunParity::run, "Macrame: deferred dependency notifications: the record node filed and the scene update drained the same run-parity slot in run " + itos(MacrameRunParity::run) + " (run parity overlap).");
 		}
 	}
 };

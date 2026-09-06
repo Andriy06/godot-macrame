@@ -42,6 +42,10 @@
 #include "servers/rendering/rendering_device_enums.h"
 #include "servers/rendering/rendering_server_enums.h"
 
+#ifdef MACRAME_ENABLED
+#include "core/macrame/macrame_run_parity.h"
+#endif
+
 class DependencyTracker;
 
 class Dependency {
@@ -66,12 +70,24 @@ public:
 	void changed_notify(DependencyChangedNotification p_notification);
 	void deleted_notify(const RID &p_rid);
 
+	Dependency();
 	~Dependency();
 
 private:
 	friend class DependencyTracker;
 	HashMap<DependencyTracker *, uint32_t> instances;
+#ifdef MACRAME_ENABLED
+	uint64_t macrame_serial = 0; // See `MacrameDeferredNotify`.
+#endif
 };
+
+#ifdef MACRAME_ENABLED
+// `Dependency::instances` and `DependencyTracker::dependencies` are the scene update's: a record
+// node that mutated them would race the update of the same run (the lagged shape). Deterministic.
+#define MACRAME_DEPENDENCY_TRACKER_CHECK() CRASH_COND_MSG(MacrameRunParity::on_record_node(), "Macrame: a dependency tracker mutated by the record node (the dependency graph is the scene update's).")
+#else
+#define MACRAME_DEPENDENCY_TRACKER_CHECK() ((void)0)
+#endif
 
 class DependencyTracker {
 public:
@@ -83,15 +99,18 @@ public:
 	DeletedCallback deleted_callback = nullptr;
 
 	void update_begin() { // call before updating dependencies
+		MACRAME_DEPENDENCY_TRACKER_CHECK();
 		instance_version++;
 	}
 
 	void update_dependency(Dependency *p_dependency) { //called internally, can't be used directly, use update functions in Storage
+		MACRAME_DEPENDENCY_TRACKER_CHECK();
 		dependencies.insert(p_dependency);
 		p_dependency->instances[this] = instance_version;
 	}
 
 	void update_end() { //call after updating dependencies
+		MACRAME_DEPENDENCY_TRACKER_CHECK();
 		List<Pair<Dependency *, DependencyTracker *>> to_clean_up;
 
 		for (Dependency *E : dependencies) {
@@ -114,6 +133,9 @@ public:
 	}
 
 	void clear() { // clear all dependencies
+		if (!dependencies.is_empty()) {
+			MACRAME_DEPENDENCY_TRACKER_CHECK(); // An empty tracker destroyed by the record node touches nothing.
+		}
 		for (Dependency *E : dependencies) {
 			Dependency *dep = E;
 			dep->instances.erase(this);

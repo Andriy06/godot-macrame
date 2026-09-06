@@ -30,7 +30,23 @@
 
 #include "utilities.h"
 
+Dependency::Dependency() {
+#ifdef MACRAME_ENABLED
+	CRASH_COND_MSG(MacrameRunParity::on_record_node(), "Macrame: a dependency created by the record node (storage objects are the scene update's).");
+	macrame_serial = MacrameDeferredNotify::next_serial++;
+	MacrameDeferredNotify::live.insert(macrame_serial);
+#endif
+}
+
 void Dependency::changed_notify(DependencyChangedNotification p_notification) {
+#ifdef MACRAME_ENABLED
+	if (MacrameRunParity::on_record_node()) {
+		// The walk over `instances` is the scene update's; the record node files the notification
+		// and the next update walks it (see `MacrameDeferredNotify`).
+		MacrameDeferredNotify::add(this, macrame_serial, int(p_notification));
+		return;
+	}
+#endif
 	for (const KeyValue<DependencyTracker *, uint32_t> &E : instances) {
 		if (E.key->changed_callback) {
 			E.key->changed_callback(p_notification, E.key);
@@ -39,6 +55,9 @@ void Dependency::changed_notify(DependencyChangedNotification p_notification) {
 }
 
 void Dependency::deleted_notify(const RID &p_rid) {
+#ifdef MACRAME_ENABLED
+	CRASH_COND_MSG(MacrameRunParity::on_record_node(), "Macrame: a dependency deleted by the record node (storage objects are the scene update's).");
+#endif
 	for (const KeyValue<DependencyTracker *, uint32_t> &E : instances) {
 		if (E.key->deleted_callback) {
 			E.key->deleted_callback(p_rid, E.key);
@@ -51,6 +70,9 @@ void Dependency::deleted_notify(const RID &p_rid) {
 }
 
 Dependency::~Dependency() {
+#ifdef MACRAME_ENABLED
+	MacrameDeferredNotify::live.erase(macrame_serial);
+#endif
 #ifdef DEBUG_ENABLED
 	if (instances.size()) {
 		WARN_PRINT("Leaked instance dependency: Bug - did not call instance_notify_deleted when freeing.");

@@ -34,6 +34,7 @@
 #include "core/macrame/macrame_phase_probe.h"
 #include "core/macrame/macrame_render_grant.h"
 #include "ts/parallel_for.h"
+#include "ts/scheduler.h"
 
 
 #include "core/config/project_settings.h"
@@ -379,7 +380,7 @@ void RenderForwardClustered::_render_list_template(RenderingDevice::DrawListID p
 		void *mesh_surface;
 
 		if (shadow_pass || p_pass_mode == PASS_MODE_DEPTH) { //regular depth pass can use these too
-			material_uniform_set = surf->material_uniform_set_shadow;
+			material_uniform_set = surf->material_shadow->uniform_set;
 			shader = surf->shader_shadow;
 			mesh_surface = surf->surface_shadow;
 
@@ -396,7 +397,7 @@ void RenderForwardClustered::_render_list_template(RenderingDevice::DrawListID p
 				shader = scene_shader.debug_shadow_splits_material_shader_ptr;
 			} else {
 #endif
-				material_uniform_set = surf->material_uniform_set;
+				material_uniform_set = surf->material->uniform_set;
 				shader = surf->shader;
 				surf->material->set_as_used();
 #ifdef DEBUG_ENABLED
@@ -1870,14 +1871,6 @@ void RenderForwardClustered::_process_sss(Ref<RenderSceneBuffersRD> p_render_buf
 }
 
 void RenderForwardClustered::_render_prepared_scene(FrameRenderData *p_fd, RenderDataRD *p_render_data, const Color &p_default_bg_color) {
-	if (surfaces_awaiting_material_set.size()) {
-		// The material's uniform set exists now (the resource update ran at the head of this
-		// record); a material without uniforms keeps a null set, as in stock Godot.
-		for (GeometryInstanceSurfaceDataCache *sc : surfaces_awaiting_material_set) {
-			sc->material_uniform_set = sc->material->uniform_set;
-		}
-		surfaces_awaiting_material_set.clear();
-	}
 	RenderFrameLists &l = *static_cast<RenderFrameLists *>(p_fd);
 	scene_state.used_uniform_buffer_count = 0;
 	_update_global_pipeline_data_requirements_from_project();
@@ -4511,7 +4504,17 @@ void RenderForwardClustered::GeometryInstanceForwardClustered::_mark_dirty() {
 	RenderForwardClustered::get_singleton()->geometry_instance_dirty_list.add(&dirty_list_element);
 }
 
+#ifdef MACRAME_ENABLED
+// `global_pipeline_data_required` is the record node's: every writer sits in a body that records
+// into the device (the passes) or in these two refreshes at the head of the record; a scene update
+// that refreshed it beside a recording record node would tear the bitfield. Deterministic.
+#define MACRAME_PIPELINE_DATA_CHECK() CRASH_COND_MSG(ts::current_worker_index() >= 0 && !MacrameRecord::holds_grant(), "Macrame: global_pipeline_data_required written by a node without the recording grant.")
+#else
+#define MACRAME_PIPELINE_DATA_CHECK() ((void)0)
+#endif
+
 void RenderForwardClustered::_update_global_pipeline_data_requirements_from_project() {
+	MACRAME_PIPELINE_DATA_CHECK();
 	const int msaa_3d_mode = GLOBAL_GET_CACHED(int, "rendering/anti_aliasing/quality/msaa_3d");
 	const bool directional_shadow_16_bits = GLOBAL_GET_CACHED(bool, "rendering/lights_and_shadows/directional_shadow/16_bits");
 	const bool positional_shadow_16_bits = GLOBAL_GET_CACHED(bool, "rendering/lights_and_shadows/positional_shadow/atlas_16_bits");
@@ -4521,6 +4524,7 @@ void RenderForwardClustered::_update_global_pipeline_data_requirements_from_proj
 }
 
 void RenderForwardClustered::_update_global_pipeline_data_requirements_from_light_storage() {
+	MACRAME_PIPELINE_DATA_CHECK();
 	RendererRD::LightStorage *light_storage = RendererRD::LightStorage::get_singleton();
 	global_pipeline_data_required.use_shadow_cubemaps = light_storage->get_shadow_cubemaps_used();
 	global_pipeline_data_required.use_shadow_dual_paraboloid = light_storage->get_shadow_dual_paraboloid_used();
@@ -4609,7 +4613,6 @@ void RenderForwardClustered::_geometry_instance_add_surface_with_material(Geomet
 
 	sdcache->shader = p_material->shader_data;
 	sdcache->material = p_material;
-	sdcache->material_uniform_set = p_material->uniform_set;
 	sdcache->surface = mesh_storage->mesh_get_surface(p_mesh, p_surface);
 	sdcache->primitive = mesh_storage->mesh_surface_get_primitive(sdcache->surface);
 	sdcache->surface_index = p_surface;
@@ -4620,7 +4623,7 @@ void RenderForwardClustered::_geometry_instance_add_surface_with_material(Geomet
 
 	//shadow
 	sdcache->shader_shadow = material_shadow->shader_data;
-	sdcache->material_uniform_set_shadow = material_shadow->uniform_set;
+	sdcache->material_shadow = material_shadow;
 
 	sdcache->surface_shadow = surface_shadow ? surface_shadow : sdcache->surface;
 
@@ -5369,6 +5372,10 @@ void RenderForwardClustered::geometry_instance_free(RenderGeometryInstance *p_ge
 	if (ginstance->dirty_list_element.in_list()) {
 		ginstance->dirty_list_element.remove_from_list();
 	}
+	// The dependency graph is this node's (the scene update): unlinked here, not by the record
+	// node's destructor of `data` two runs later, which would mutate the dependencies' instance
+	// maps beside the scene update of that run.
+	ginstance->data->dependency_tracker.clear();
 	// The instance itself (and its data) is freed by the record node once no recorded frame
 	// names it any more.
 	if (!defer_frees) {
@@ -5446,12 +5453,8 @@ void RenderForwardClustered::apply_run_data(void *p_run_data) {
 		if (!sc->compilation_all_element.in_list()) {
 			geometry_surface_compilation_all_list.add(&sc->compilation_all_element);
 		}
-		if (sc->material_uniform_set.is_null() && sc->material) {
-			surfaces_awaiting_material_set.push_back(sc);
-		}
 	}
 	for (GeometryInstanceSurfaceDataCache *sc : r->surface_frees) {
-		surfaces_awaiting_material_set.erase(sc);
 		if (sc->compilation_dirty_element.in_list()) {
 			sc->compilation_dirty_element.remove_from_list();
 		}

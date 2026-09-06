@@ -580,12 +580,14 @@ private:
 		uint32_t color_pass_inclusion_mask = 0;
 
 		void *surface = nullptr;
-		RID material_uniform_set;
 		SceneShaderForwardClustered::ShaderData *shader = nullptr;
+		// The material's uniform set is read through these at record time, never cached here:
+		// the record node's resource update is what creates and recreates it, so a snapshot taken
+		// by the scene update was stale for a run (a null set for the first draw of a new surface).
 		SceneShaderForwardClustered::MaterialData *material = nullptr;
 
 		void *surface_shadow = nullptr;
-		RID material_uniform_set_shadow;
+		SceneShaderForwardClustered::MaterialData *material_shadow = nullptr;
 		SceneShaderForwardClustered::ShaderData *shader_shadow = nullptr;
 
 		GeometryInstanceSurfaceDataCache *next = nullptr;
@@ -825,9 +827,6 @@ private:
 	LocalVector<GeometryInstanceSurfaceDataCache *> pending_surface_frees;
 	LocalVector<GeometryInstanceForwardClustered *> pending_instance_frees;
 	LocalVector<GeometryInstanceForwardClustered *> pending_transforms_refresh;
-	// New surfaces whose material had no uniform set when the update node built them: the record
-	// node's resource update creates it; the set is read into the cache before the draw.
-	LocalVector<GeometryInstanceSurfaceDataCache *> surfaces_awaiting_material_set;
 	void _geometry_instance_transforms_uniform_set(GeometryInstanceForwardClustered *ginstance);
 	void _geometry_instance_transforms_uniform_set_now(GeometryInstanceForwardClustered *ginstance);
 	// Dirty marks that reach the record node (a material's uniform layout changed on upload) are
