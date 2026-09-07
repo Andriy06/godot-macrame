@@ -1000,12 +1000,24 @@ void RenderingServerDefault::macrame_idle_frame(double p_step) {
 	}
 	_macrame_frame_boundary(false, p_step, false);
 	command_queue.sync(); // Applies both journals under the grant, on this thread.
-	command_queue.get_guarded().access([](RenderGrantToken &) {
+	command_queue.get_guarded().access([this](RenderGrantToken &) {
 							 MacrameRender::set_holds_grant(true);
 							 MacrameRecord::set_holds_grant(true);
 							 RSG::viewport->macrame_update_head();
 							 RSG::scene->macrame_update_head();
 							 RSG::canvas->macrame_update_head();
+							 // The batch just applied is a scene update, so it created and freed
+							 // surface caches and geometry instances into the renderer's pending
+							 // hand-off lists. No cull node will collect them and no record node
+							 // will apply them, so this thread does both: it holds the recording
+							 // grant and owns every parity slot, and nothing is in flight.
+							 if (!single_run_data) {
+								 single_run_data = RSG::scene->macrame_run_data_create();
+							 }
+							 if (single_run_data) {
+								 RSG::scene->macrame_collect_run_data(single_run_data);
+								 RSG::scene->macrame_apply_run_data(single_run_data);
+							 }
 							 MacrameRecord::set_holds_grant(false);
 							 MacrameRender::set_holds_grant(false);
 						 })

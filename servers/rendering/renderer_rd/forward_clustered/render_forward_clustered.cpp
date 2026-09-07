@@ -5432,6 +5432,20 @@ void RenderForwardClustered::run_data_free(void *p_run_data) {
 void RenderForwardClustered::collect_run_data(void *p_run_data) {
 	RunData *r = static_cast<RunData *>(p_run_data);
 	ERR_FAIL_NULL(r);
+	// The hand-off is one run deep: the update node fills the pending lists, the cull node moves
+	// them into the run's value, the record node applies and clears them. A value that still
+	// holds a previous run's entries, or a pending list that a run never collected, means a node
+	// stopped running while the scene kept changing - which is how the process reached 14 GB and
+	// died in `LocalVector<GeometryInstanceSurfaceDataCache *>::reserve` with no other message
+	// (results 2.18 row 17). The scene's own churn is thousands of surfaces a second at worst, so
+	// this bound is far above any honest frame and far below the runaway.
+	constexpr uint32_t MAX_HANDOFF = 200000;
+	CRASH_COND_MSG(pending_new_surfaces.size() > MAX_HANDOFF || pending_surface_frees.size() > MAX_HANDOFF || pending_instance_frees.size() > MAX_HANDOFF,
+			vformat("Macrame: the renderer's update -> record hand-off passed %d entries (new %d, frees %d, instances %d): a run collected nothing while the scene kept changing.",
+					MAX_HANDOFF, pending_new_surfaces.size(), pending_surface_frees.size(), pending_instance_frees.size()));
+	CRASH_COND_MSG(r->new_surfaces.size() > MAX_HANDOFF || r->surface_frees.size() > MAX_HANDOFF || r->instance_frees.size() > MAX_HANDOFF,
+			vformat("Macrame: a run value's hand-off passed %d entries (new %d, frees %d, instances %d): its record node never applied it.",
+					MAX_HANDOFF, r->new_surfaces.size(), r->surface_frees.size(), r->instance_frees.size()));
 	for (GeometryInstanceSurfaceDataCache *sc : pending_new_surfaces) {
 		r->new_surfaces.push_back(sc);
 	}
