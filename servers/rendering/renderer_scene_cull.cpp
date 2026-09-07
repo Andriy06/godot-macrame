@@ -41,6 +41,8 @@
 #include "core/object/worker_thread_pool.h"
 #include "servers/rendering/rendering_light_culler.h"
 #include "servers/rendering/rendering_server.h"
+
+#include <cstdlib>
 #include "servers/rendering/rendering_server_default.h"
 
 #ifndef XR_DISABLED
@@ -3928,7 +3930,15 @@ void RendererSceneCull::_draw_culled_scene(RenderSceneCullFrame &p_frame) {
 	// reads them, and a skeleton written once (a pose set at spawn, never animated) is skinned
 	// once - with the upload after the dispatch it was skinned from a buffer never written and
 	// stayed invisible (found by the static screenshot of the lagged shape).
-	scene_render->macrame_upload_frame_resources(p_frame.frame_number);
+	//
+	// The two knobs skip one phase each. They make rendering wrong on purpose: they exist to
+	// bound what either phase is worth before optimising it, in this node and in the submit node
+	// that replays what it records (results 2.22.2).
+	static const bool skip_skel_upload = std::getenv("MACRAME_SKIP_SKEL_UPLOAD") != nullptr;
+	static const bool skip_skinning = std::getenv("MACRAME_SKIP_SKINNING") != nullptr;
+	if (!skip_skel_upload) {
+		scene_render->macrame_upload_frame_resources(p_frame.frame_number);
+	}
 	MACRAME_PHASE("rc: frame resources (skeleton slot upload)");
 
 	// The visible particle systems of this frame join the storage's update list here, under the
@@ -3940,7 +3950,7 @@ void RendererSceneCull::_draw_culled_scene(RenderSceneCullFrame &p_frame) {
 
 	// Skinning and blend shapes for every visible skinned mesh: a compute dispatch, so it belongs
 	// to the node that holds the recording grant.
-	if (p_frame.mesh_instances_to_update.size()) {
+	if (p_frame.mesh_instances_to_update.size() && !skip_skinning) {
 		for (const RID &mi : p_frame.mesh_instances_to_update) {
 			RSG::mesh_storage->mesh_instance_check_for_update(mi);
 		}
