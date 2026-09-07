@@ -33,6 +33,8 @@
 #include "servers/rendering/rendering_server_enums.h"
 #include "servers/rendering/rendering_server_types.h"
 
+#include "core/macrame/macrame_canvas_stamp.h"
+
 class RenderingServer;
 
 class RendererCanvasRender {
@@ -384,6 +386,7 @@ public:
 
 		template <typename T>
 		T *alloc_command() {
+			MACRAME_CANVAS_WRITE();
 			T *command = nullptr;
 			if (commands == nullptr) {
 				// As the most common use case of canvas items is to
@@ -430,6 +433,7 @@ public:
 		}
 
 		void clear() {
+			MACRAME_CANVAS_WRITE();
 			// The first one is always allocated on heap
 			// the rest go in the blocks
 			Command *c = commands;

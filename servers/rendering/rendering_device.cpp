@@ -7841,13 +7841,26 @@ void RenderingDevice::free_rid(RID p_rid) {
 }
 
 #ifdef MACRAME_ENABLED
-void RenderingDevice::macrame_free_deferred() {
-	macrame_deferred_frees.apply([this](RID p_rid) {
+void RenderingDevice::macrame_free_deferred(bool p_teardown) {
+	macrame_deferred_frees.apply([this, p_teardown](RID p_rid) {
+		if (!_macrame_owns(p_rid)) {
+			// At the teardown the storages free their objects directly, on the blue thread, before
+			// the device applies what the last runs deferred: those entries are stale by then, not
+			// double frees. In a run it is a double free: named, so the second path can be found.
+			if (!p_teardown) {
+				ERR_PRINT("Macrame: a deferred device free of ID " + itos(p_rid.get_id()) + " finds it already freed (queued by the scene update, applied by the " + MacramePhaseProbe::current_lane_name() + ", device frame " + itos(frames_drawn) + ").");
+			}
+			return;
+		}
 		_free_dependencies(p_rid);
 		_free_internal(p_rid);
 	});
 }
 #endif
+
+bool RenderingDevice::_macrame_owns(RID p_id) const {
+	return texture_owner.owns(p_id) || framebuffer_owner.owns(p_id) || sampler_owner.owns(p_id) || vertex_buffer_owner.owns(p_id) || vertex_array_owner.owns(p_id) || index_buffer_owner.owns(p_id) || index_array_owner.owns(p_id) || shader_owner.owns(p_id) || uniform_buffer_owner.owns(p_id) || texture_buffer_owner.owns(p_id) || storage_buffer_owner.owns(p_id) || uniform_set_owner.owns(p_id) || render_pipeline_owner.owns(p_id) || compute_pipeline_owner.owns(p_id);
+}
 
 void RenderingDevice::_free_internal(RID p_id) {
 #ifdef MACRAME_ENABLED
@@ -7987,6 +8000,8 @@ void RenderingDevice::_free_internal(RID p_id) {
 	} else {
 #ifdef DEV_ENABLED
 		ERR_PRINT("Attempted to free invalid ID: " + itos(p_id.get_id()) + " " + resource_name);
+#elif defined(MACRAME_ENABLED)
+		ERR_PRINT("Attempted to free invalid ID: " + itos(p_id.get_id()) + " (from the " + MacramePhaseProbe::current_lane_name() + ", device frame " + itos(frames_drawn) + ").");
 #else
 		ERR_PRINT("Attempted to free invalid ID: " + itos(p_id.get_id()));
 #endif
@@ -9229,7 +9244,7 @@ uint64_t RenderingDevice::limit_get(Limit p_limit) const {
 
 void RenderingDevice::finalize() {
 #ifdef MACRAME_ENABLED
-	macrame_free_deferred(); // The teardown (blue thread) owns both slots.
+	macrame_free_deferred(true); // The teardown (blue thread) owns both slots; what the storages already freed is skipped.
 #endif
 	ERR_RENDER_THREAD_GUARD();
 

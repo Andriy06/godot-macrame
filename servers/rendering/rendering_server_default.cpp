@@ -29,6 +29,7 @@
 /**************************************************************************/
 
 #include "rendering_server_default.h"
+#include "core/macrame/macrame_canvas_stamp.h"
 #include "core/macrame/macrame_run_parity.h"
 
 #include "core/macrame/macrame_phase_probe.h"
@@ -360,6 +361,7 @@ void RenderingServerDefault::_draw_update(double frame_step) {
 		// mailbox, the viewport order, the buffers viewports want, the probes' atlas buffers.
 		RSG::viewport->macrame_update_head();
 		RSG::scene->macrame_update_head();
+		RSG::canvas->macrame_update_head();
 		MACRAME_PHASE("su: mailboxes, viewport head");
 	}
 #endif
@@ -922,6 +924,7 @@ void RenderingServerDefault::draw(bool p_present, double frame_step) {
 		MacrameDeferredNotify::check_boundary();
 		RSG::viewport->macrame_check_boundary();
 		RSG::scene->macrame_check_boundary();
+		MacrameCanvasStamp::check_boundary();
 		if (RenderingDevice::get_singleton()) {
 			RenderingDevice::get_singleton()->macrame_run_boundary();
 		}

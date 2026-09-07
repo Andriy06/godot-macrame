@@ -493,6 +493,9 @@ void RendererCanvasCull::_cull_canvas_item(Item *p_canvas_item, const Transform2
 }
 
 void RendererCanvasCull::render_canvas(RID p_render_target, Canvas *p_canvas, const Transform2D &p_transform, RendererCanvasRender::Light *p_lights, RendererCanvasRender::Light *p_directional_lights, const Rect2 &p_clip_rect, RSE::CanvasItemTextureFilter p_default_filter, RSE::CanvasItemTextureRepeat p_default_repeat, bool p_snap_2d_transforms_to_pixel, bool p_snap_2d_vertices_to_pixel, uint32_t canvas_cull_mask, RenderingServerTypes::RenderInfo *r_render_info) {
+#ifdef MACRAME_ENABLED
+	MacrameCanvasStamp::note_draw();
+#endif
 	sdf_used = false;
 	snapping_2d_transforms_to_pixel = p_snap_2d_transforms_to_pixel;
 
@@ -557,6 +560,7 @@ void RendererCanvasCull::canvas_set_disable_scale(bool p_disable) {
 }
 
 void RendererCanvasCull::canvas_set_parent(RID p_canvas, RID p_parent, float p_scale) {
+	MACRAME_CANVAS_WRITE();
 	Canvas *canvas = canvas_owner.get_or_null(p_canvas);
 	ERR_FAIL_NULL(canvas);
 
@@ -574,6 +578,7 @@ void RendererCanvasCull::canvas_item_initialize(RID p_rid) {
 }
 
 void RendererCanvasCull::canvas_item_set_parent(RID p_item, RID p_parent) {
+	MACRAME_CANVAS_WRITE();
 	Item *canvas_item = canvas_item_owner.get_or_null(p_item);
 	ERR_FAIL_NULL(canvas_item);
 
@@ -618,6 +623,7 @@ void RendererCanvasCull::canvas_item_set_parent(RID p_item, RID p_parent) {
 }
 
 void RendererCanvasCull::canvas_item_set_visible(RID p_item, bool p_visible) {
+	MACRAME_CANVAS_WRITE();
 	Item *canvas_item = canvas_item_owner.get_or_null(p_item);
 	ERR_FAIL_NULL(canvas_item);
 
@@ -634,6 +640,7 @@ void RendererCanvasCull::canvas_item_set_light_mask(RID p_item, int p_mask) {
 }
 
 void RendererCanvasCull::canvas_item_set_transform(RID p_item, const Transform2D &p_transform) {
+	MACRAME_CANVAS_WRITE();
 	Item *canvas_item = canvas_item_owner.get_or_null(p_item);
 	ERR_FAIL_NULL(canvas_item);
 
@@ -679,6 +686,7 @@ void RendererCanvasCull::canvas_item_set_distance_field_mode(RID p_item, bool p_
 }
 
 void RendererCanvasCull::canvas_item_set_custom_rect(RID p_item, bool p_custom_rect, const Rect2 &p_rect) {
+	MACRAME_CANVAS_WRITE();
 	Item *canvas_item = canvas_item_owner.get_or_null(p_item);
 	ERR_FAIL_NULL(canvas_item);
 
@@ -687,6 +695,7 @@ void RendererCanvasCull::canvas_item_set_custom_rect(RID p_item, bool p_custom_r
 }
 
 void RendererCanvasCull::canvas_item_set_modulate(RID p_item, const Color &p_color) {
+	MACRAME_CANVAS_WRITE();
 	Item *canvas_item = canvas_item_owner.get_or_null(p_item);
 	ERR_FAIL_NULL(canvas_item);
 
@@ -694,6 +703,7 @@ void RendererCanvasCull::canvas_item_set_modulate(RID p_item, const Color &p_col
 }
 
 void RendererCanvasCull::canvas_item_set_self_modulate(RID p_item, const Color &p_color) {
+	MACRAME_CANVAS_WRITE();
 	Item *canvas_item = canvas_item_owner.get_or_null(p_item);
 	ERR_FAIL_NULL(canvas_item);
 
@@ -1881,6 +1891,7 @@ void RendererCanvasCull::canvas_item_set_sort_children_by_y(RID p_item, bool p_e
 }
 
 void RendererCanvasCull::canvas_item_set_z_index(RID p_item, int p_z) {
+	MACRAME_CANVAS_WRITE();
 	ERR_FAIL_COND(p_z < RSE::CANVAS_ITEM_Z_MIN || p_z > RSE::CANVAS_ITEM_Z_MAX);
 
 	Item *canvas_item = canvas_item_owner.get_or_null(p_item);
@@ -1956,6 +1967,7 @@ void RendererCanvasCull::canvas_item_clear(RID p_item) {
 }
 
 void RendererCanvasCull::canvas_item_set_draw_index(RID p_item, int p_index) {
+	MACRAME_CANVAS_WRITE();
 	Item *canvas_item = canvas_item_owner.get_or_null(p_item);
 	ERR_FAIL_NULL(canvas_item);
 
@@ -1975,6 +1987,7 @@ void RendererCanvasCull::canvas_item_set_draw_index(RID p_item, int p_index) {
 }
 
 void RendererCanvasCull::canvas_item_set_material(RID p_item, RID p_material) {
+	MACRAME_CANVAS_WRITE();
 	Item *canvas_item = canvas_item_owner.get_or_null(p_item);
 	ERR_FAIL_NULL(canvas_item);
 
@@ -1983,6 +1996,7 @@ void RendererCanvasCull::canvas_item_set_material(RID p_item, RID p_material) {
 }
 
 void RendererCanvasCull::canvas_item_set_use_parent_material(RID p_item, bool p_enable) {
+	MACRAME_CANVAS_WRITE();
 	Item *canvas_item = canvas_item_owner.get_or_null(p_item);
 	ERR_FAIL_NULL(canvas_item);
 
@@ -2164,6 +2178,7 @@ void RendererCanvasCull::canvas_light_set_texture_scale(RID p_light, float p_sca
 }
 
 void RendererCanvasCull::canvas_light_set_transform(RID p_light, const Transform2D &p_transform) {
+	MACRAME_CANVAS_WRITE();
 	RendererCanvasRender::Light *clight = canvas_light_owner.get_or_null(p_light);
 	ERR_FAIL_NULL(clight);
 
@@ -2385,6 +2400,7 @@ void RendererCanvasCull::canvas_light_occluder_set_as_sdf_collision(RID p_occlud
 }
 
 void RendererCanvasCull::canvas_light_occluder_set_transform(RID p_occluder, const Transform2D &p_xform) {
+	MACRAME_CANVAS_WRITE();
 	RendererCanvasRender::LightOccluderInstance *occluder = canvas_light_occluder_owner.get_or_null(p_occluder);
 	ERR_FAIL_NULL(occluder);
 
@@ -2610,6 +2626,7 @@ bool RendererCanvasCull::free(RID p_rid) {
 	if (canvas_owner.owns(p_rid)) {
 		Canvas *canvas = canvas_owner.get_or_null(p_rid);
 		ERR_FAIL_NULL_V(canvas, false);
+		MACRAME_CANVAS_WRITE();
 
 		while (canvas->viewports.size()) {
 			RendererViewport::Viewport *vp = RSG::viewport->viewport_owner.get_or_null(*canvas->viewports.begin());
@@ -2634,11 +2651,17 @@ bool RendererCanvasCull::free(RID p_rid) {
 			E->canvas = RID();
 		}
 
+#ifdef MACRAME_ENABLED
+		if (macrame_canvas_frees.defer(p_rid)) {
+			return true; // Unlinked now; the struct goes two runs later (`macrame_update_head`).
+		}
+#endif
 		canvas_owner.free(p_rid);
 
 	} else if (canvas_item_owner.owns(p_rid)) {
 		Item *canvas_item = canvas_item_owner.get_or_null(p_rid);
 		ERR_FAIL_NULL_V(canvas_item, true);
+		MACRAME_CANVAS_WRITE();
 		_interpolation_data.notify_free_canvas_item(p_rid, *canvas_item);
 
 		if (canvas_item->parent.is_valid()) {
@@ -2672,11 +2695,17 @@ bool RendererCanvasCull::free(RID p_rid) {
 			canvas_item->canvas_group = nullptr;
 		}
 
+#ifdef MACRAME_ENABLED
+		if (macrame_item_frees.defer(p_rid)) {
+			return true;
+		}
+#endif
 		canvas_item_owner.free(p_rid);
 
 	} else if (canvas_light_owner.owns(p_rid)) {
 		RendererCanvasRender::Light *canvas_light = canvas_light_owner.get_or_null(p_rid);
 		ERR_FAIL_NULL_V(canvas_light, true);
+		MACRAME_CANVAS_WRITE();
 		_interpolation_data.notify_free_canvas_light(p_rid, *canvas_light);
 
 		if (canvas_light->canvas.is_valid()) {
@@ -2688,11 +2717,17 @@ bool RendererCanvasCull::free(RID p_rid) {
 
 		RSG::canvas_render->free(canvas_light->light_internal);
 
+#ifdef MACRAME_ENABLED
+		if (macrame_light_frees.defer(p_rid)) {
+			return true;
+		}
+#endif
 		canvas_light_owner.free(p_rid);
 
 	} else if (canvas_light_occluder_owner.owns(p_rid)) {
 		RendererCanvasRender::LightOccluderInstance *occluder = canvas_light_occluder_owner.get_or_null(p_rid);
 		ERR_FAIL_NULL_V(occluder, true);
+		MACRAME_CANVAS_WRITE();
 		_interpolation_data.notify_free_canvas_light_occluder(p_rid, *occluder);
 
 		if (occluder->polygon.is_valid()) {
@@ -2707,6 +2742,11 @@ bool RendererCanvasCull::free(RID p_rid) {
 			canvas->occluders.erase(occluder);
 		}
 
+#ifdef MACRAME_ENABLED
+		if (macrame_occluder_frees.defer(p_rid)) {
+			return true;
+		}
+#endif
 		canvas_light_occluder_owner.free(p_rid);
 
 	} else if (canvas_light_occluder_polygon_owner.owns(p_rid)) {
@@ -2742,7 +2782,23 @@ void RendererCanvasCull::_free_rids(T &p_owner, const char *p_type) {
 	}
 }
 
+#ifdef MACRAME_ENABLED
+void RendererCanvasCull::macrame_apply_frees(bool p_all) {
+	macrame_item_frees.apply([this](RID p_rid) { if (canvas_item_owner.owns(p_rid)) { canvas_item_owner.free(p_rid); } }, p_all);
+	macrame_canvas_frees.apply([this](RID p_rid) { if (canvas_owner.owns(p_rid)) { canvas_owner.free(p_rid); } }, p_all);
+	macrame_light_frees.apply([this](RID p_rid) { if (canvas_light_owner.owns(p_rid)) { canvas_light_owner.free(p_rid); } }, p_all);
+	macrame_occluder_frees.apply([this](RID p_rid) { if (canvas_light_occluder_owner.owns(p_rid)) { canvas_light_occluder_owner.free(p_rid); } }, p_all);
+}
+
+void RendererCanvasCull::macrame_update_head() {
+	macrame_apply_frees(false);
+}
+#endif
+
 void RendererCanvasCull::finalize() {
+#ifdef MACRAME_ENABLED
+	macrame_apply_frees(true);
+#endif
 	_free_rids(canvas_owner, "Canvas");
 	_free_rids(canvas_item_owner, "CanvasItem");
 	_free_rids(canvas_light_owner, "CanvasLight");

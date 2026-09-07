@@ -1984,6 +1984,9 @@ private:
 public:
 	void _free_internal(RID p_id);
 #ifdef MACRAME_ENABLED
+	bool _macrame_owns(RID p_id) const;
+#endif
+#ifdef MACRAME_ENABLED
 	String _macrame_null_set_message(const char *p_where, uint32_t p_index, RID p_set) const;
 #endif
 	void _check_no_open_lists();
@@ -2011,7 +2014,7 @@ public:
 	// A free from a node without the recording grant (the scene update's journal) waits for the
 	// record node: the dispose lists are the recording's. Applied under the recording grant.
 	MacrameParityFrees<RID> macrame_deferred_frees;
-	void macrame_free_deferred();
+	void macrame_free_deferred(bool p_teardown = false);
 	void macrame_run_boundary() { macrame_deferred_frees.check_boundary("device frees"); }
 #endif
 	void texture_replace_rid(RID p_old_texture, RID p_new_texture);

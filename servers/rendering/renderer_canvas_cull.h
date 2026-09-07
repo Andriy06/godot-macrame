@@ -378,6 +378,16 @@ public:
 
 	void update_visibility_notifiers();
 	void update_dirty_items();
+#ifdef MACRAME_ENABLED
+	// The three-node pipeline: a freed canvas, item, light or occluder is unlinked at once and its
+	// struct freed two runs later, when no copy of a viewport the record node draws names it.
+	MacrameRunFrees<RID> macrame_canvas_frees;
+	MacrameRunFrees<RID> macrame_item_frees;
+	MacrameRunFrees<RID> macrame_light_frees;
+	MacrameRunFrees<RID> macrame_occluder_frees;
+	void macrame_apply_frees(bool p_all);
+	void macrame_update_head();
+#endif
 
 	void _update_dirty_item(Item *p_item);
 
