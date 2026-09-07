@@ -317,6 +317,21 @@ void RenderForwardClustered::update() {
 
 /// RENDERING ///
 
+#ifdef MACRAME_ENABLED
+// The extract's tripwire (results 2.18 row 17). The record node's draw reads only what the cull
+// copied into the frame, so a rebuilt or freed instance can no longer reach it; this checks that
+// the copy is still the one it was made from. The cache itself is alive to be read - the deferred
+// surface free is what keeps it so for exactly one run - but if the scene update of this run
+// rebuilt the instance, the element's frame is stale and drawing it would be the row-17 bug.
+// Monotonic generations mean a recycled allocation slot cannot pass either.
+#define MACRAME_SURFACE_GENERATION_CHECK(m_element)                                                                    \
+	CRASH_COND_MSG((m_element).surf_cull_only != nullptr && (m_element).surf_cull_only->generation != (m_element).surf_generation, \
+			vformat("Macrame: the record node drew a frame whose surface cache was rebuilt under it (element generation %d, cache %d): the extract is incomplete.", \
+					(m_element).surf_generation, (m_element).surf_cull_only->generation))
+#else
+#define MACRAME_SURFACE_GENERATION_CHECK(m_element) ((void)0)
+#endif
+
 template <RenderForwardClustered::PassMode p_pass_mode, uint32_t p_color_pass_flags>
 void RenderForwardClustered::_render_list_template(RenderingDevice::DrawListID p_draw_list, RenderingDevice::FramebufferFormatID p_framebuffer_Format, RenderListParameters *p_params, uint32_t p_from_element, uint32_t p_to_element) {
 	RendererRD::MeshStorage *mesh_storage = RendererRD::MeshStorage::get_singleton();
@@ -359,7 +374,12 @@ void RenderForwardClustered::_render_list_template(RenderingDevice::DrawListID p
 
 	for (uint32_t i = p_from_element; i < p_to_element; i++) {
 		const RenderElement &element = p_params->elements[i];
-		const GeometryInstanceSurfaceDataCache *surf = element.surf;
+		// No `element.surf_cull_only` here, by design (results 2.18 row 17): this is the record
+		// node, a run behind the cull that listed the element, and the scene update running beside
+		// it is free to have rebuilt the instance's surface caches or freed the instance. The draw
+		// reads only what the cull copied into the frame. The one exception is the generation
+		// check below, which reads a cache the deferred free keeps alive for exactly this purpose.
+		MACRAME_SURFACE_GENERATION_CHECK(element);
 		const RenderElementInfo &element_info = p_params->element_info[i];
 		// A repeat run may straddle the end of this recorder's element range: draw only its share,
 		// the recorder that starts at p_to_element draws the rest. Without a split this is a no-op.
@@ -371,7 +391,7 @@ void RenderForwardClustered::_render_list_template(RenderingDevice::DrawListID p
 			continue;
 		}
 
-		if (surf->owner->instance_count == 0) {
+		if (element.instance_count == 0) {
 			continue;
 		}
 
@@ -381,9 +401,9 @@ void RenderForwardClustered::_render_list_template(RenderingDevice::DrawListID p
 		void *mesh_surface;
 
 		if (shadow_pass || p_pass_mode == PASS_MODE_DEPTH) { //regular depth pass can use these too
-			material_uniform_set = surf->material_shadow->uniform_set;
-			shader = surf->shader_shadow;
-			mesh_surface = surf->surface_shadow;
+			material_uniform_set = element.material_shadow->uniform_set;
+			shader = element.shader_shadow;
+			mesh_surface = element.surface_shadow;
 
 		} else {
 #ifdef DEBUG_ENABLED
@@ -398,13 +418,13 @@ void RenderForwardClustered::_render_list_template(RenderingDevice::DrawListID p
 				shader = scene_shader.debug_shadow_splits_material_shader_ptr;
 			} else {
 #endif
-				material_uniform_set = surf->material->uniform_set;
-				shader = surf->shader;
-				surf->material->set_as_used();
+				material_uniform_set = element.material->uniform_set;
+				shader = element.shader;
+				element.material->set_as_used();
 #ifdef DEBUG_ENABLED
 			}
 #endif
-			mesh_surface = surf->surface;
+			mesh_surface = element.surface;
 		}
 
 		if (!mesh_surface) {
@@ -422,13 +442,13 @@ void RenderForwardClustered::_render_list_template(RenderingDevice::DrawListID p
 			cull_variant = SceneShaderForwardClustered::ShaderData::CULL_VARIANT_DOUBLE_SIDED;
 		} else {
 			if constexpr (p_pass_mode == PASS_MODE_SHADOW || p_pass_mode == PASS_MODE_SHADOW_DP) {
-				if (surf->flags & GeometryInstanceSurfaceDataCache::FLAG_USES_DOUBLE_SIDED_SHADOWS) {
+				if (element.surf_flags & GeometryInstanceSurfaceDataCache::FLAG_USES_DOUBLE_SIDED_SHADOWS) {
 					cull_variant = SceneShaderForwardClustered::ShaderData::CULL_VARIANT_DOUBLE_SIDED;
 				}
 			}
 
 			if (cull_variant == SceneShaderForwardClustered::ShaderData::CULL_VARIANT_MAX) {
-				bool mirror = surf->owner->mirror;
+				bool mirror = element.mirror;
 				if (p_params->reverse_cull) {
 					mirror = !mirror;
 				}
@@ -437,16 +457,16 @@ void RenderForwardClustered::_render_list_template(RenderingDevice::DrawListID p
 			}
 		}
 
-		pipeline_key.primitive_type = surf->primitive;
+		pipeline_key.primitive_type = element.primitive;
 
-		RID xforms_uniform_set = surf->owner->transforms_uniform_set;
+		RID xforms_uniform_set = element.transforms_uniform_set;
 
 		SceneShaderForwardClustered::ShaderSpecialization pipeline_specialization = p_params->base_specialization;
-		pipeline_specialization.multimesh = bool(surf->owner->base_flags & INSTANCE_DATA_FLAG_MULTIMESH);
-		pipeline_specialization.multimesh_format_2d = bool(surf->owner->base_flags & INSTANCE_DATA_FLAG_MULTIMESH_FORMAT_2D);
-		pipeline_specialization.multimesh_has_color = bool(surf->owner->base_flags & INSTANCE_DATA_FLAG_MULTIMESH_HAS_COLOR);
-		pipeline_specialization.multimesh_has_custom_data = bool(surf->owner->base_flags & INSTANCE_DATA_FLAG_MULTIMESH_HAS_CUSTOM_DATA);
-		pipeline_specialization.material_feedback = p_params->use_material_feedback && surf->material->material_feedback_rid.is_valid();
+		pipeline_specialization.multimesh = bool(element.base_flags & INSTANCE_DATA_FLAG_MULTIMESH);
+		pipeline_specialization.multimesh_format_2d = bool(element.base_flags & INSTANCE_DATA_FLAG_MULTIMESH_FORMAT_2D);
+		pipeline_specialization.multimesh_has_color = bool(element.base_flags & INSTANCE_DATA_FLAG_MULTIMESH_HAS_COLOR);
+		pipeline_specialization.multimesh_has_custom_data = bool(element.base_flags & INSTANCE_DATA_FLAG_MULTIMESH_HAS_CUSTOM_DATA);
+		pipeline_specialization.material_feedback = p_params->use_material_feedback && element.material->material_feedback_rid.is_valid();
 
 		if constexpr (p_pass_mode == PASS_MODE_COLOR) {
 			pipeline_specialization.use_light_soft_shadows = element_info.uses_softshadow;
@@ -525,8 +545,8 @@ void RenderForwardClustered::_render_list_template(RenderingDevice::DrawListID p
 			RD::VertexFormatID vertex_format = -1;
 			bool pipeline_motion_vectors = pipeline_key.color_pass_flags & SceneShaderForwardClustered::PIPELINE_COLOR_PASS_FLAG_MOTION_VECTORS;
 			uint64_t input_mask = shader->get_vertex_input_mask(pipeline_key.version, pipeline_key.color_pass_flags, pipeline_key.ubershader);
-			if (surf->owner->mesh_instance.is_valid()) {
-				mesh_storage->mesh_instance_surface_get_vertex_arrays_and_format(surf->owner->mesh_instance, surf->surface_index, input_mask, pipeline_motion_vectors, emulate_point_size, vertex_array_rd, vertex_format);
+			if (element.mesh_instance.is_valid()) {
+				mesh_storage->mesh_instance_surface_get_vertex_arrays_and_format(element.mesh_instance, element.surface_index, input_mask, pipeline_motion_vectors, emulate_point_size, vertex_array_rd, vertex_format);
 			} else {
 				mesh_storage->mesh_surface_get_vertex_arrays_and_format(mesh_surface, input_mask, pipeline_motion_vectors, emulate_point_size, vertex_array_rd, vertex_format);
 			}
@@ -607,10 +627,10 @@ void RenderForwardClustered::_render_list_template(RenderingDevice::DrawListID p
 				prev_material_uniform_set = material_uniform_set;
 			}
 
-			if (surf->owner->base_flags & INSTANCE_DATA_FLAG_PARTICLES) {
-				particles_storage->particles_get_instance_buffer_motion_vectors_offsets(surf->owner->data->base, push_constant.multimesh_motion_vectors_current_offset, push_constant.multimesh_motion_vectors_previous_offset);
-			} else if (surf->owner->base_flags & INSTANCE_DATA_FLAG_MULTIMESH) {
-				mesh_storage->_multimesh_get_motion_vectors_offsets(surf->owner->data->base, push_constant.multimesh_motion_vectors_current_offset, push_constant.multimesh_motion_vectors_previous_offset);
+			if (element.base_flags & INSTANCE_DATA_FLAG_PARTICLES) {
+				particles_storage->particles_get_instance_buffer_motion_vectors_offsets(element.base, push_constant.multimesh_motion_vectors_current_offset, push_constant.multimesh_motion_vectors_previous_offset);
+			} else if (element.base_flags & INSTANCE_DATA_FLAG_MULTIMESH) {
+				mesh_storage->_multimesh_get_motion_vectors_offsets(element.base, push_constant.multimesh_motion_vectors_current_offset, push_constant.multimesh_motion_vectors_previous_offset);
 			} else {
 				push_constant.multimesh_motion_vectors_current_offset = 0;
 				push_constant.multimesh_motion_vectors_previous_offset = 0;
@@ -628,12 +648,12 @@ void RenderForwardClustered::_render_list_template(RenderingDevice::DrawListID p
 
 			RD::get_singleton()->draw_list_set_push_constant(draw_list, &push_constant, push_constant_size);
 
-			uint32_t instance_count = surf->owner->instance_count > 1 ? surf->owner->instance_count : element_repeat;
-			if (surf->flags & GeometryInstanceSurfaceDataCache::FLAG_USES_PARTICLE_TRAILS) {
-				instance_count /= surf->owner->trail_steps;
+			uint32_t instance_count = element.instance_count > 1 ? element.instance_count : element_repeat;
+			if (element.surf_flags & GeometryInstanceSurfaceDataCache::FLAG_USES_PARTICLE_TRAILS) {
+				instance_count /= element.trail_steps;
 			}
 
-			bool indirect = bool(surf->owner->base_flags & INSTANCE_DATA_FLAG_MULTIMESH_INDIRECT);
+			bool indirect = bool(element.base_flags & INSTANCE_DATA_FLAG_MULTIMESH_INDIRECT);
 
 			if (emulate_point_size) {
 				if (indirect) {
@@ -641,7 +661,7 @@ void RenderForwardClustered::_render_list_template(RenderingDevice::DrawListID p
 				}
 				RD::get_singleton()->draw_list_draw(draw_list, false, mesh_storage->mesh_surface_get_vertex_count(mesh_surface), instance_count * 6);
 			} else if (indirect) {
-				RD::get_singleton()->draw_list_draw_indirect(draw_list, index_array_rd.is_valid(), mesh_storage->_multimesh_get_command_buffer_rd_rid(surf->owner->data->base), surf->surface_index * sizeof(uint32_t) * mesh_storage->INDIRECT_MULTIMESH_COMMAND_STRIDE, 1, 0);
+				RD::get_singleton()->draw_list_draw_indirect(draw_list, index_array_rd.is_valid(), mesh_storage->_multimesh_get_command_buffer_rd_rid(element.base), element.surface_index * sizeof(uint32_t) * mesh_storage->INDIRECT_MULTIMESH_COMMAND_STRIDE, 1, 0);
 			} else {
 				RD::get_singleton()->draw_list_draw(draw_list, index_array_rd.is_valid(), instance_count);
 			}
@@ -947,7 +967,7 @@ void RenderForwardClustered::_generate_instance_data(RenderFrameLists &p_lists, 
 	const RenderElement *prev_element = nullptr;
 	for (uint32_t i = 0; i < element_total; i++) {
 		const RenderElement &element = rl->elements[i + p_offset];
-		GeometryInstanceSurfaceDataCache *surface = element.surf;
+		GeometryInstanceSurfaceDataCache *surface = element.surf_cull_only;
 		GeometryInstanceForwardClustered *inst = surface->owner;
 
 		SceneState::InstanceData instance_data;
@@ -1005,7 +1025,7 @@ void RenderForwardClustered::_generate_instance_data(RenderFrameLists &p_lists, 
 
 		const bool cant_repeat = instance_data.flags & INSTANCE_DATA_FLAG_MULTIMESH || inst->mesh_instance.is_valid();
 
-		if (prev_element != nullptr && !cant_repeat && prev_element->sort.sort_key1 == element.sort.sort_key1 && prev_element->sort.sort_key2 == element.sort.sort_key2 && prev_element->uses_lightmap_specular == element.uses_lightmap_specular && inst->mirror == prev_element->surf->owner->mirror && repeats < RenderElementInfo::MAX_REPEATS) {
+		if (prev_element != nullptr && !cant_repeat && prev_element->sort.sort_key1 == element.sort.sort_key1 && prev_element->sort.sort_key2 == element.sort.sort_key2 && prev_element->uses_lightmap_specular == element.uses_lightmap_specular && inst->mirror == prev_element->mirror && repeats < RenderElementInfo::MAX_REPEATS) {
 			//this element is the same as the previous one, count repeats to draw it using instancing
 			repeats++;
 		} else {
@@ -1246,7 +1266,7 @@ void RenderForwardClustered::_fill_render_list(RenderFrameLists &p_lists, Render
 
 		while (surf) {
 			RenderElement e;
-			e.surf = surf;
+			e.surf_cull_only = surf;
 			e.sort = surf->sort; // The static part; the per-frame bits follow.
 			e.sort.uses_forward_gi = 0;
 			e.sort.uses_lightmap = uses_lightmap ? 1 : 0;
@@ -1254,6 +1274,27 @@ void RenderForwardClustered::_fill_render_list(RenderFrameLists &p_lists, Render
 			e.uses_lightmap_specular = uses_lightmap && uses_lightmap_specular;
 			e.color_pass_inclusion_mask = 0;
 			e.depth = inst->depth;
+			// The extract (results 2.18 row 17): everything the record node's draw needs from the
+			// instance *and* from the surface cache, copied into the frame here, so a run later it
+			// dereferences neither. This is the cull node, immediately after the scene update of
+			// its own run, which is the only point where both are live and settled.
+			e.base_flags = inst->base_flags;
+			e.instance_count = inst->instance_count;
+			e.trail_steps = inst->trail_steps;
+			e.mirror = inst->mirror;
+			e.mesh_instance = inst->mesh_instance;
+			e.transforms_uniform_set = inst->transforms_uniform_set;
+			e.base = inst->data->base;
+			e.surf_flags = surf->flags;
+			e.surface_index = surf->surface_index;
+			e.surf_generation = surf->generation;
+			e.primitive = surf->primitive;
+			e.surface = surf->surface;
+			e.surface_shadow = surf->surface_shadow;
+			e.shader = surf->shader;
+			e.shader_shadow = surf->shader_shadow;
+			e.material = surf->material;
+			e.material_shadow = surf->material_shadow;
 
 			// LOD
 			if (p_render_data->scene_data->screen_mesh_lod_threshold > 0.0 && mesh_storage->mesh_surface_has_lod(surf->surface)) {
@@ -4507,6 +4548,7 @@ void RenderForwardClustered::GeometryInstanceForwardClustered::_mark_dirty() {
 
 #ifdef MACRAME_ENABLED
 // `global_pipeline_data_required` is the record node's: every writer sits in a body that records
+// (see also MACRAME_SURFACE_GENERATION_CHECK, defined above the record node's draw)
 // into the device (the passes) or in these two refreshes at the head of the record; a scene update
 // that refreshed it beside a recording record node would tear the bitfield. Deterministic.
 #define MACRAME_PIPELINE_DATA_CHECK() CRASH_COND_MSG(ts::current_worker_index() >= 0 && !MacrameRecord::holds_grant(), "Macrame: global_pipeline_data_required written by a node without the recording grant.")
@@ -4609,6 +4651,12 @@ void RenderForwardClustered::_geometry_instance_add_surface_with_material(Geomet
 	}
 
 	GeometryInstanceSurfaceDataCache *sdcache = geometry_instance_surface_alloc.alloc();
+
+#ifdef MACRAME_ENABLED
+	// The generation the frame's elements carry (results 2.18 row 17). Monotonic and never reset,
+	// so a recycled allocation slot cannot pass for the cache an older frame listed.
+	sdcache->generation = ++surface_generation_counter;
+#endif
 
 	sdcache->flags = flags;
 
@@ -5466,6 +5514,23 @@ void RenderForwardClustered::collect_run_data(void *p_run_data) {
 }
 
 void RenderForwardClustered::_delete_awaiting_instances() {
+	static const bool leak_diag_i = []() {
+		const char *env = std::getenv("MACRAME_LEAK_DIAG");
+		return env != nullptr && atoi(env) != 0;
+	}();
+	if (leak_diag_i) {
+		instances_awaiting_delete.clear(); // See `apply_run_data`: leak rather than free here.
+		return;
+	}
+	if (MacrameRunParity::on_record_node()) {
+		// Same reason as the surface caches above: `geometry_instance_alloc` belongs to the scene
+		// update node. Hand them over; that node frees them at its head next run.
+		for (GeometryInstanceForwardClustered *gi : instances_awaiting_delete) {
+			instance_free_mailbox.add(gi);
+		}
+		instances_awaiting_delete.clear();
+		return;
+	}
 	for (GeometryInstanceForwardClustered *gi : instances_awaiting_delete) {
 		memdelete(gi->data);
 		geometry_instance_alloc.free(gi);
@@ -5475,9 +5540,33 @@ void RenderForwardClustered::_delete_awaiting_instances() {
 
 // The record node, at the head of the frame the run value belongs to: by now no recorded frame
 // names what the update freed, and the new surfaces join the compilation lists.
+// The scene update node's head. It owns both allocators (it is their only `alloc()` caller), so it
+// is where everything the record node unlinked is actually returned to them - one run later, which
+// is the same grace the rest of the pipeline's frees get (results 2.18 row 17).
+void RenderForwardClustered::macrame_update_head() {
+	surface_free_mailbox.drain([this](GeometryInstanceSurfaceDataCache *sc) {
+		geometry_instance_surface_alloc.free(sc);
+	});
+	instance_free_mailbox.drain([this](GeometryInstanceForwardClustered *gi) {
+		memdelete(gi->data);
+		geometry_instance_alloc.free(gi);
+	});
+}
+
+// The blue thread's frame boundary, forwarded by `RendererSceneCull`: the mailbox check belongs
+// here, where the run is settled, not on the update node that drains it.
+void RenderForwardClustered::macrame_check_boundary() {
+	surface_free_mailbox.check_boundary("the renderer's surface frees");
+	instance_free_mailbox.check_boundary("the renderer's instance frees");
+}
+
 void RenderForwardClustered::apply_run_data(void *p_run_data) {
 	RunData *r = static_cast<RunData *>(p_run_data);
 	ERR_FAIL_NULL(r);
+	static const bool leak_diag = []() {
+		const char *env = std::getenv("MACRAME_LEAK_DIAG");
+		return env != nullptr && atoi(env) != 0;
+	}();
 	for (GeometryInstanceSurfaceDataCache *sc : r->new_surfaces) {
 		if (!sc->compilation_dirty_element.in_list()) {
 			geometry_surface_compilation_dirty_list.add(&sc->compilation_dirty_element);
@@ -5493,7 +5582,13 @@ void RenderForwardClustered::apply_run_data(void *p_run_data) {
 		if (sc->compilation_all_element.in_list()) {
 			sc->compilation_all_element.remove_from_list();
 		}
-		geometry_instance_surface_alloc.free(sc);
+		// The lists above are this node's; the allocator is not. `geometry_instance_surface_alloc`
+		// is a `PagedAllocator`, it is not thread-safe, and the scene update node running beside
+		// this one is its only `alloc()` caller - freeing here raced it, which is results 2.18
+		// row 17. Hand the unlinked cache to the scene update of the next run instead.
+		if (!leak_diag) {
+			surface_free_mailbox.add(sc);
+		}
 	}
 	for (GeometryInstanceForwardClustered *gi : r->transforms_refresh) {
 		if (!gi->pending_free) { // Freed instances are still allocated here (below), never drawn.
@@ -5805,6 +5900,24 @@ RenderForwardClustered::~RenderForwardClustered() {
 		RunData now;
 		collect_run_data(&now);
 		apply_run_data(&now);
+		// `apply_run_data` gives the instances it takes one more run of grace, and there is no
+		// next run: without this drain the last tear-down batch is the "Pages in use exist at exit
+		// in PagedAllocator: GeometryInstanceForwardClustered" leak.
+		_delete_awaiting_instances();
+		// Nothing is in flight, so the hand-off to the scene update has no next run to land in.
+		// Both parity slots, by hand: `drain()` only ever takes the one the current run is not
+		// writing, and at tear-down there is no next run to come back for the other.
+		for (int slot = 0; slot < 2; slot++) {
+			for (GeometryInstanceSurfaceDataCache *sc : surface_free_mailbox.slots[slot]) {
+				geometry_instance_surface_alloc.free(sc);
+			}
+			for (GeometryInstanceForwardClustered *gi : instance_free_mailbox.slots[slot]) {
+				memdelete(gi->data);
+				geometry_instance_alloc.free(gi);
+			}
+		}
+		surface_free_mailbox.clear();
+		instance_free_mailbox.clear();
 		defer_frees = false;
 	}
 	if (ss_effects != nullptr) {

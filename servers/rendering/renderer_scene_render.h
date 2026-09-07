@@ -394,6 +394,10 @@ public:
 	virtual void run_data_free(void *p_run_data) {}
 	virtual void collect_run_data(void *p_run_data) {}
 	virtual void apply_run_data(void *p_run_data) {}
+	// The scene update node's head, forwarded by `RendererSceneCull`: the renderer drains what the
+	// record node handed it into the allocators the scene update owns (results 2.18 row 17).
+	virtual void macrame_update_head() {}
+	virtual void macrame_check_boundary() {}
 	virtual void macrame_run_boundary() {}
 	// Macrame: the record node's per-frame resource uploads (the skeleton ring slot of the frame).
 	virtual void macrame_upload_frame_resources(uint64_t p_frame) {}

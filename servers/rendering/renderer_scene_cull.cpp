@@ -4775,6 +4775,7 @@ PackedByteArray RendererSceneCull::bake_render_area_light_atlas(const TypedArray
 
 #ifdef MACRAME_ENABLED
 void RendererSceneCull::macrame_check_boundary() {
+	scene_render->macrame_check_boundary();
 	macrame_cull_requests.check_boundary("cull requests (probe redraws, voxel GI updates)");
 	macrame_job_results.check_boundary("job results (probes, voxel GI, heightfields)");
 }
@@ -4782,6 +4783,9 @@ void RendererSceneCull::macrame_check_boundary() {
 // The scene update, at its head: what the cull saw and the record finished, applied by the owner
 // of the lists and flags they name; then what this run's cull will need of the scene.
 void RendererSceneCull::macrame_update_head() {
+	// The renderer's allocators first: this node is their only allocator, so it is also the only
+	// node that may free into them (results 2.18 row 17).
+	scene_render->macrame_update_head();
 	macrame_cull_requests.drain([this](const MacrameCullRequest &q) {
 		Instance *instance = instance_owner.get_or_null(q.instance);
 		if (!instance || !instance->scenario || !instance->base_data) {

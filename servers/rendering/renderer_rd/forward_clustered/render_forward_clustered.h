@@ -30,6 +30,7 @@
 
 #pragma once
 
+#include "core/macrame/macrame_run_parity.h"
 #include "core/templates/paged_allocator.h"
 #include "servers/rendering/multi_uma_buffer.h"
 #include "servers/rendering/renderer_rd/cluster_builder_rd.h"
@@ -246,12 +247,47 @@ private:
 
 	// One element of a frame's render list: the surface and the per-frame part of its sort key
 	// and pass membership. Owned by the frame, not by the surface cache.
+	//
+	// The extract (results 2.18 row 17). Two nodes read an element, a run apart. The cull node
+	// lists it and generates its instance data in the same run as the scene update that owns the
+	// surface cache and the instance, so it may reach through both: `surf_cull_only` is for it.
+	// The record node draws it a run later, beside a scene update free to rebuild that instance's
+	// caches or to free the instance outright, so it may reach through neither - every value its
+	// draw needs is copied here instead, by the cull, into the frame that owns it. That is what
+	// closes row 17. The pointers and RIDs below are sound to hold for a run because their owners
+	// are the storages, which defer their frees by run parity (554d03b), not the instance.
 	struct RenderElement {
-		GeometryInstanceSurfaceDataCache *surf = nullptr;
+		// Cull-node only. The deferred surface free keeps this alive for a run, but its *contents*
+		// are whatever the scene update did next, so the record node's draw reads none of them.
+		GeometryInstanceSurfaceDataCache *surf_cull_only = nullptr;
 		SurfaceSortKey sort;
 		float depth = 0.0f;
 		uint32_t color_pass_inclusion_mask = 0;
 		bool uses_lightmap_specular = false;
+
+		// From the instance.
+		uint32_t base_flags = 0;
+		uint32_t instance_count = 0;
+		uint32_t trail_steps = 1;
+		bool mirror = false;
+		RID mesh_instance;
+		RID transforms_uniform_set;
+		RID base; // Only for the multimesh and particles motion-vector offsets.
+
+		// From the surface cache. The material and shader data belong to the material storage,
+		// which defers its frees by run parity, so these pointers survive the run; the material's
+		// uniform set is still read live *through* them, because the record node's own resource
+		// update is what creates it and a snapshot would be a run stale (787e341).
+		uint32_t surf_flags = 0;
+		uint32_t surface_index = 0;
+		uint32_t surf_generation = 0;
+		RSE::PrimitiveType primitive = RSE::PRIMITIVE_MAX;
+		void *surface = nullptr;
+		void *surface_shadow = nullptr;
+		SceneShaderForwardClustered::ShaderData *shader = nullptr;
+		SceneShaderForwardClustered::ShaderData *shader_shadow = nullptr;
+		SceneShaderForwardClustered::MaterialData *material = nullptr;
+		SceneShaderForwardClustered::MaterialData *material_shadow = nullptr;
 	};
 
 	struct RenderListParameters {
@@ -573,6 +609,12 @@ private:
 
 		SurfaceSortKey sort;
 
+		// Stamped from a global counter when the scene update builds this cache, copied into every
+		// element the cull lists from it, and checked by the record node's draw a run later: if
+		// the update of that run rebuilt the instance, the cache the element came from is on the
+		// deferred-free list and this slot now holds a different generation (or a recycled one),
+		// so the mismatch faults where it happens instead of drawing from rebuilt state.
+		uint32_t generation = 0;
 		RSE::PrimitiveType primitive = RSE::PRIMITIVE_MAX;
 		uint32_t flags = 0;
 		uint32_t surface_index = 0;
@@ -844,6 +886,22 @@ private:
 	LocalVector<GeometryInstanceForwardClustered *> instances_awaiting_delete;
 	void _delete_awaiting_instances();
 	bool defer_frees = true; // Off from the destructor on: nothing is in flight, free at once.
+#ifdef MACRAME_ENABLED
+	// The allocators below belong to the scene update node: it is the only caller of `alloc()`,
+	// and a `PagedAllocator` is not thread-safe. The record node, which unlinks a dead surface or
+	// instance from the lists it owns, therefore may not free it: it hands it here instead, and
+	// the scene update of the next run drains these into the allocators at its head
+	// (`macrame_update_head`). Without that hop the two nodes call `alloc()` and `free()` on one
+	// allocator at the same time, which is results 2.18 row 17.
+	MacrameParityMailbox<GeometryInstanceSurfaceDataCache *> surface_free_mailbox;
+	MacrameParityMailbox<GeometryInstanceForwardClustered *> instance_free_mailbox;
+
+	// Stamped into every surface cache the scene update builds, copied into every element the cull
+	// lists from it (results 2.18 row 17). Written only by the scene update, which is the only node
+	// that builds caches, so it needs no synchronisation of its own.
+	uint32_t surface_generation_counter = 0;
+#endif
+
 	void _defer_surface_free(GeometryInstanceSurfaceDataCache *p_surface) {
 		if (!defer_frees) {
 			if (p_surface->compilation_dirty_element.in_list()) {
@@ -974,6 +1032,10 @@ public:
 	virtual void run_data_free(void *p_run_data) override;
 	virtual void collect_run_data(void *p_run_data) override;
 	virtual void apply_run_data(void *p_run_data) override;
+	// The scene update node's head: drains what the record node unlinked into the allocators it
+	// owns (results 2.18 row 17). Virtual on the base so `RendererSceneCull` can call it.
+	virtual void macrame_update_head() override;
+	virtual void macrame_check_boundary() override;
 	// The blue thread, between runs, with everything joined: the batch that the next record node
 	// will delete must be named by neither dirty-mark slot. That is the invariant the extra run of
 	// grace buys, made deterministic.
