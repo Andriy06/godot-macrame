@@ -867,6 +867,109 @@ void RenderingServerDefault::sync() {
 	}
 }
 
+#ifdef MACRAME_ENABLED
+// The frame boundary, on the blue thread, with nothing in flight: the graph run of this
+// iteration has been joined and the next one has not started. It is the pipeline's clock, so it
+// ticks on every iteration, whether or not a frame is drawn: `p_post_render` false is the
+// iteration that draws nothing (every window minimized), where the nodes must idle but the
+// journal still has to be cut, the versioned front invalidated and the run parity advanced.
+void RenderingServerDefault::_macrame_frame_boundary(bool p_present, double p_step, bool p_post_render) {
+	GodotProfileZone("Macrame: frame boundary");
+	// The frame boundary, on the blue thread, with nothing in flight: the graph run of this
+	// iteration has been joined and the next one has not started. This is all `draw()` does in
+	// frame-graph mode - no launch, no join. The frame it posts is drawn by the `render` node
+	// of the next run and submitted by the `submit` node of the run after that.
+
+	// 1. The outputs the render node staged during the run that just ended become the version
+	//    the next run's shards read.
+	MacrameRenderSnapshot::publish();
+
+	// 2. What that render node staged for the device is what the next run's submit node
+	//    drains. `last_render_slot` is written by the render node and read only here.
+	submit_slot = last_render_slot;
+	last_render_slot = -1;
+
+	// 2b. The lists (versioned shape): what the cull node staged this run becomes the version
+	//     the next run's record node reads; the set that record node just finished with is
+	//     free again. Nothing staged means nothing to record next run: the front is
+	//     invalidated so the same frame is never recorded twice.
+	if (lists_lagged) {
+		if (!lists_staged) {
+			lists_recorder.stage([](MacrameRenderLists &p_front) { p_front.valid = false; });
+		}
+		lists_versioned.publish().sync(); // A blue thread; the run is joined.
+		if (front_set >= 0) {
+			cull_sets[front_set].state = CullSet::FREE;
+			front_set = -1;
+		}
+		if (lists_staged) {
+			cull_sets[cull_set].state = CullSet::PUBLISHED;
+			front_set = cull_set;
+		}
+		lists_staged = false;
+	}
+
+	// 3. Cut the command journal: everything staged up to this point - by this run's shards
+	//    and by the blue thread since the last cut - becomes the batch the next run's render
+	//    node applies under the grant. New commands stage into the other journal.
+	command_queue.cut_journal();
+
+	// 4. Post the frame. `draw_seq` is the frame number the ring's ownership is keyed on.
+	render_present = p_present;
+	render_step = p_step;
+	render_slot = int(draw_seq % HANDOFF_SLOTS);
+	// The storages' run boundary: copies for the record node's next run, then the run number
+	// the parity lists key on (nobody reads it while it moves: the run is joined).
+	RSG::utilities->macrame_run_boundary();
+	MacrameDeferredNotify::check_boundary();
+	RSG::viewport->macrame_check_boundary();
+	RSG::scene->macrame_check_boundary();
+	MacrameCanvasStamp::check_boundary();
+	if (RenderingDevice::get_singleton()) {
+		RenderingDevice::get_singleton()->macrame_run_boundary();
+	}
+	MacrameRunParity::post(draw_seq);
+	post_frame_number = draw_seq;
+	cull_set = int(draw_seq % CULL_SETS); // The parity set the next cull fills: FREE by construction (checked there).
+	if (lists_lagged) {
+		RSG::scene->macrame_frame_posted(draw_seq); // The skeleton slot the next scene update writes.
+		RSG::scene->macrame_run_boundary(); // The deferred-notification parity flips.
+	}
+	draw_seq++;
+	if (p_post_render) {
+		render_request = true;
+	}
+}
+
+// The iteration that draws nothing: every window is minimized, so `Main::iteration` skips
+// `draw()`. The simulation still runs, so the boundary still has to tick - otherwise the shards
+// keep staging into a journal nobody applies (unbounded: about 1.5 MB of bone poses a frame at
+// 500 NPCs), the run parity never advances so the storages' deferred frees never drain, and the
+// record node of the next run reads the front the cull node handed over two boundaries ago and
+// re-records it (which `RendererViewport::_draw_3d`'s prepared-cull check catches, fatally).
+// Nothing is rendered here: the boundary posts no render request, so the four render nodes idle,
+// and the blue thread - which owns every guarded object between two runs, and drains both parity
+// slots by construction - applies the batch and runs the heads the scene update would have run.
+void RenderingServerDefault::macrame_idle_frame(double p_step) {
+	if (!MacrameScene::frame_graph_running()) {
+		return;
+	}
+	_macrame_frame_boundary(false, p_step, false);
+	command_queue.sync(); // Applies both journals under the grant, on this thread.
+	command_queue.get_guarded().access([](RenderGrantToken &) {
+							 MacrameRender::set_holds_grant(true);
+							 MacrameRecord::set_holds_grant(true);
+							 RSG::viewport->macrame_update_head();
+							 RSG::scene->macrame_update_head();
+							 RSG::canvas->macrame_update_head();
+							 MacrameRecord::set_holds_grant(false);
+							 MacrameRender::set_holds_grant(false);
+						 })
+			.sync();
+}
+
+#endif // MACRAME_ENABLED
+
 void RenderingServerDefault::draw(bool p_present, double frame_step) {
 	ERR_FAIL_COND_MSG(!Thread::is_main_thread(), "Manually triggering the draw function from the RenderingServer can only be done on the main thread. Call this function from the main thread or use call_deferred().");
 	// Needs to be done before changes is reset to 0, to not force the editor to redraw.
@@ -874,69 +977,7 @@ void RenderingServerDefault::draw(bool p_present, double frame_step) {
 	changes = 0;
 #ifdef MACRAME_ENABLED
 	if (MacrameScene::frame_graph_running()) {
-		// The frame boundary, on the blue thread, with nothing in flight: the graph run of this
-		// iteration has been joined and the next one has not started. This is all `draw()` does in
-		// frame-graph mode - no launch, no join. The frame it posts is drawn by the `render` node
-		// of the next run and submitted by the `submit` node of the run after that.
-		GodotProfileZone("Macrame: frame boundary");
-
-		// 1. The outputs the render node staged during the run that just ended become the version
-		//    the next run's shards read.
-		MacrameRenderSnapshot::publish();
-
-		// 2. What that render node staged for the device is what the next run's submit node
-		//    drains. `last_render_slot` is written by the render node and read only here.
-		submit_slot = last_render_slot;
-		last_render_slot = -1;
-
-		// 2b. The lists (versioned shape): what the cull node staged this run becomes the version
-		//     the next run's record node reads; the set that record node just finished with is
-		//     free again. Nothing staged means nothing to record next run: the front is
-		//     invalidated so the same frame is never recorded twice.
-		if (lists_lagged) {
-			if (!lists_staged) {
-				lists_recorder.stage([](MacrameRenderLists &p_front) { p_front.valid = false; });
-			}
-			lists_versioned.publish().sync(); // A blue thread; the run is joined.
-			if (front_set >= 0) {
-				cull_sets[front_set].state = CullSet::FREE;
-				front_set = -1;
-			}
-			if (lists_staged) {
-				cull_sets[cull_set].state = CullSet::PUBLISHED;
-				front_set = cull_set;
-			}
-			lists_staged = false;
-		}
-
-		// 3. Cut the command journal: everything staged up to this point - by this run's shards
-		//    and by the blue thread since the last cut - becomes the batch the next run's render
-		//    node applies under the grant. New commands stage into the other journal.
-		command_queue.cut_journal();
-
-		// 4. Post the frame. `draw_seq` is the frame number the ring's ownership is keyed on.
-		render_present = p_present;
-		render_step = frame_step;
-		render_slot = int(draw_seq % HANDOFF_SLOTS);
-		// The storages' run boundary: copies for the record node's next run, then the run number
-		// the parity lists key on (nobody reads it while it moves: the run is joined).
-		RSG::utilities->macrame_run_boundary();
-		MacrameDeferredNotify::check_boundary();
-		RSG::viewport->macrame_check_boundary();
-		RSG::scene->macrame_check_boundary();
-		MacrameCanvasStamp::check_boundary();
-		if (RenderingDevice::get_singleton()) {
-			RenderingDevice::get_singleton()->macrame_run_boundary();
-		}
-		MacrameRunParity::post(draw_seq);
-		post_frame_number = draw_seq;
-		cull_set = int(draw_seq % CULL_SETS); // The parity set the next cull fills: FREE by construction (checked there).
-		if (lists_lagged) {
-			RSG::scene->macrame_frame_posted(draw_seq); // The skeleton slot the next scene update writes.
-			RSG::scene->macrame_run_boundary(); // The deferred-notification parity flips.
-		}
-		draw_seq++;
-		render_request = true;
+		_macrame_frame_boundary(p_present, frame_step, true);
 		return;
 	}
 	// No graph is running this iteration (start-up, before the scene tree exists): draw

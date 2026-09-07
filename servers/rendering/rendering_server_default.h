@@ -139,6 +139,7 @@ class RenderingServerDefault : public RenderingServer {
 
 	void _macrame_render_node();
 	void _macrame_submit_node();
+	void _macrame_frame_boundary(bool p_present, double p_step, bool p_post_render);
 
 	// The three-node render pipeline (results 2.16): `scene update` writes the render server,
 	// `cull` reads it and writes the lists, `record` reads both and writes the device's recording
@@ -1410,6 +1411,9 @@ public:
 	// null-checked). It also submits whatever the hand-off ring still holds: the last run's
 	// render node staged a frame that no submit node will ever consume.
 	void macrame_drain_commands();
+	// The iteration that draws nothing (every window minimized): the boundary still ticks and
+	// the blue thread applies what the idle render nodes will not. See the definition.
+	virtual void macrame_idle_frame(double p_step) override;
 #endif
 	virtual void tick() override;
 	virtual void pre_draw(bool p_will_draw) override;

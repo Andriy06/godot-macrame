@@ -58,6 +58,8 @@
 #include "ts/scheduler.h"
 #include "ts/task.h"
 
+#include "core/error/error_macros.h"
+#include "core/string/ustring.h"
 #include "core/macrame/macrame_scene.h"
 #include "core/profiling/profiling.h"
 
@@ -83,6 +85,10 @@ class MacrameCommandQueue {
 	};
 
 	ts::Guarded<Token> guarded;
+	// About 125 frames of the heaviest scene measured (16,000 commands a frame at 500 NPCs). No
+	// legitimate backlog reaches it: the boundary cuts the journal once an iteration.
+	static constexpr uint64_t MAX_STAGED_COMMANDS = 2000000;
+
 	Journal journal_a;
 	Journal journal_b;
 	Journal *cur = &journal_a; // Where new commands are staged.
@@ -145,7 +151,13 @@ public:
 		Journal &j = *cur;
 		ts::Recorder<Token> &rec = shard < 0 ? j.recorder : j.shard_recorders[shard];
 		rec.stage([=](Token &) { (p_instance->*p_method)(p_args...); });
-		j.count.fetch_add(1, std::memory_order_relaxed);
+		const uint64_t staged = j.count.fetch_add(1, std::memory_order_relaxed) + 1;
+		// A journal is emptied by the frame boundary, once an iteration. If one grows past a
+		// backlog no frame can legitimately produce, its consumer has stopped running and the
+		// journal is on its way to filling memory (about 1.5 MB of bone poses a frame at 500
+		// NPCs, so unattended this reaches tens of gigabytes and the process dies with a
+		// fail-fast and no message). Name it here instead, at the first command past the bound.
+		CRASH_COND_MSG(staged > MAX_STAGED_COMMANDS, "Macrame: the render command journal passed " + itos(MAX_STAGED_COMMANDS) + " staged commands: its frame boundary has stopped running (nothing applies it).");
 	}
 
 	template <typename T, typename M, typename... Args>

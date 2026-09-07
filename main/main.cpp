@@ -5128,19 +5128,33 @@ bool Main::iteration() {
 								 DisplayServer::get_singleton()->has_additional_outputs()) &&
 			RenderingServer::get_singleton()->is_render_loop_enabled();
 
+	bool drew_this_iteration = false;
 	if (wants_present || has_pending_resources_for_processing) {
 		wants_present |= force_redraw_requested;
 		if ((!force_redraw_requested) && OS::get_singleton()->is_in_low_processor_usage_mode()) {
 			if (RenderingServer::get_singleton()->has_changed()) {
 				RenderingServer::get_singleton()->draw(wants_present, scaled_step); // flush visual commands
 				Engine::get_singleton()->increment_frames_drawn();
+				drew_this_iteration = true;
 			}
 		} else {
 			RenderingServer::get_singleton()->draw(wants_present, scaled_step); // flush visual commands
 			Engine::get_singleton()->increment_frames_drawn();
 			force_redraw_requested = false;
+			drew_this_iteration = true;
 		}
 	}
+#ifdef MACRAME_ENABLED
+	if (!drew_this_iteration) {
+		// Macrame: `draw()` carries the render pipeline's frame boundary, and the boundary is the
+		// pipeline's clock, not a part of drawing. An iteration that draws nothing (every window
+		// minimized) still ran the frame graph, so it still has to tick: see
+		// `RenderingServerDefault::macrame_idle_frame`.
+		RenderingServer::get_singleton()->macrame_idle_frame(scaled_step);
+	}
+#else
+	(void)drew_this_iteration;
+#endif
 
 	process_ticks = OS::get_singleton()->get_ticks_usec() - process_begin;
 	process_max = MAX(process_ticks, process_max);

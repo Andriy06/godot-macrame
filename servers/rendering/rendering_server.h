@@ -984,6 +984,11 @@ public:
 	virtual void request_frame_drawn_callback(const Callable &p_callable) = 0;
 
 	virtual void draw(bool p_swap_buffers = true, double frame_step = 0.0) = 0;
+#ifdef MACRAME_ENABLED
+	// An iteration whose frame is not drawn (every window minimized): the render pipeline's
+	// boundary still has to tick, so `Main::iteration` calls this where it skips `draw()`.
+	virtual void macrame_idle_frame(double p_step) {}
+#endif
 	virtual void sync() = 0;
 	virtual bool has_changed() const = 0;
 	virtual void init();
