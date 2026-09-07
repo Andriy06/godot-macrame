@@ -85,6 +85,12 @@ struct MacrameRunParity {
 	static bool drains_both() { return ts::current_worker_index() < 0 || (MacrameRender::holds_grant() && MacrameRecord::holds_grant()) || (same_run_edge && MacrameRecord::holds_grant()); }
 	// The update node of the three-node shapes: what it frees waits.
 	static bool defers_frees() { return ts::current_worker_index() >= 0 && !MacrameRecord::holds_grant(); }
+	// The scene update node of the three-node shapes: a worker body with the render mirror alone.
+	static bool on_update_node() { return ts::current_worker_index() >= 0 && MacrameRender::holds_grant() && !MacrameRecord::holds_grant(); }
+	// The cull node of the three-node shapes: a worker body holding neither grant mirror (its
+	// render grant is const). It reads the scene and writes only its own frame; what it saw that
+	// the scene has to act on goes through a mailbox (`MacrameParityMailbox`).
+	static bool on_cull_node() { return ts::current_worker_index() >= 0 && !MacrameRender::holds_grant() && !MacrameRecord::holds_grant(); }
 	// The slot a queue from this node goes to.
 	static int add_slot() { return on_record_node() ? drain_slot() : write_slot(); }
 	// A record node's drain (a body without the render grant): the stamp the boundary compares.
@@ -93,6 +99,43 @@ struct MacrameRunParity {
 		for (int slot = 0; slot < 2; slot++) {
 			CRASH_COND_MSG(p_update_written[slot] == run && p_record_drained[slot] == run, String("Macrame: ") + p_what + ": the scene update wrote and the record node drained the same run-parity slot in run " + itos(run) + " (run parity overlap).");
 		}
+	}
+};
+
+// A one-way hand-off between two node bodies of successive runs, by run parity: the producer of
+// run r appends to slot r&1, the consumer of run r+1 drains that slot (its own run's other slot),
+// and the two stamps meet at the blue thread's boundary check, which faults if one run touched
+// both sides of a slot. What the record node and the cull node have to tell the scene update
+// (viewport results, probe advances, redraw requests) travels here instead of through the scene
+// update's own structures.
+template <class T>
+struct MacrameParityMailbox {
+	LocalVector<T> slots[2];
+	uint64_t produced[2] = { UINT64_MAX, UINT64_MAX };
+	uint64_t consumed[2] = { UINT64_MAX, UINT64_MAX };
+
+	void add(const T &p_item) {
+		const int s = int(MacrameRunParity::current() & 1);
+		produced[s] = MacrameRunParity::current();
+		slots[s].push_back(p_item);
+	}
+	template <class F>
+	void drain(F &&p_each) {
+		const int s = int(MacrameRunParity::current() & 1) ^ 1;
+		consumed[s] = MacrameRunParity::current();
+		for (const T &e : slots[s]) {
+			p_each(e);
+		}
+		slots[s].clear();
+	}
+	void check_boundary(const char *p_what) const {
+		for (int slot = 0; slot < 2; slot++) {
+			CRASH_COND_MSG(produced[slot] == MacrameRunParity::run && consumed[slot] == MacrameRunParity::run, String("Macrame: ") + p_what + ": produced and drained in the same run-parity slot in run " + itos(MacrameRunParity::run) + " (run parity overlap).");
+		}
+	}
+	void clear() {
+		slots[0].clear();
+		slots[1].clear();
 	}
 };
 

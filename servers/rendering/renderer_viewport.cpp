@@ -316,7 +316,22 @@ void RendererViewport::_configure_3d_render_buffers(Viewport *p_viewport) {
 	}
 }
 
-void RendererViewport::_draw_3d(Viewport *p_viewport) {
+#ifdef MACRAME_ENABLED
+void RendererViewport::_macrame_size_occlusion_buffer(Viewport *p_viewport) {
+	float aspect = p_viewport->size.aspect();
+	int max_size = occlusion_rays_per_thread * WorkerThreadPool::get_singleton()->get_thread_count();
+
+	int viewport_size = p_viewport->size.width * p_viewport->size.height;
+	max_size = CLAMP(max_size, viewport_size / (32 * 32), viewport_size / (2 * 2)); // At least one depth pixel for every 16x16 region. At most one depth pixel for every 2x2 region.
+
+	float height = Math::sqrt(max_size / aspect);
+	Size2i new_size = Size2i(height * aspect, height);
+	RendererSceneOcclusionCull::get_singleton()->buffer_set_size(p_viewport->self, new_size);
+	p_viewport->occlusion_buffer_dirty = false;
+}
+#endif
+
+void RendererViewport::_draw_3d(Viewport *p_viewport, const MacrameViewportSnapshot *p_snapshot) {
 #ifndef _3D_DISABLED
 	RENDER_TIMESTAMP("> Render 3D Scene");
 
@@ -329,6 +344,11 @@ void RendererViewport::_draw_3d(Viewport *p_viewport) {
 
 	if (p_viewport->use_occlusion_culling) {
 		if (p_viewport->occlusion_buffer_dirty) {
+#ifdef MACRAME_ENABLED
+			// The scene update sizes it (`macrame_update_head`); here only the combined path, the
+			// non-split draw that holds every grant.
+			_macrame_size_occlusion_buffer(p_viewport);
+#else
 			float aspect = p_viewport->size.aspect();
 			int max_size = occlusion_rays_per_thread * WorkerThreadPool::get_singleton()->get_thread_count();
 
@@ -339,6 +359,7 @@ void RendererViewport::_draw_3d(Viewport *p_viewport) {
 			Size2i new_size = Size2i(height * aspect, height);
 			RendererSceneOcclusionCull::get_singleton()->buffer_set_size(p_viewport->self, new_size);
 			p_viewport->occlusion_buffer_dirty = false;
+#endif
 		}
 	}
 
@@ -352,6 +373,10 @@ void RendererViewport::_draw_3d(Viewport *p_viewport) {
 			RENDER_TIMESTAMP("< Render 3D Scene");
 			return;
 		}
+		// The record node of the three-node pipeline reads no scene: a viewport without its
+		// prepared cull is a bug of the cull (or an XR viewport, which the pipeline does not
+		// support), not something to cull here beside the scene update.
+		CRASH_COND_MSG(p_snapshot != nullptr, "Macrame: a 3D viewport reached the record node without a prepared cull (the combined path would read the scene beside the scene update).");
 		macrame_cull_fallbacks++;
 	}
 #endif
@@ -361,7 +386,7 @@ void RendererViewport::_draw_3d(Viewport *p_viewport) {
 #endif // _3D_DISABLED
 }
 
-void RendererViewport::_draw_viewport(Viewport *p_viewport) {
+void RendererViewport::_draw_viewport(Viewport *p_viewport, const MacrameViewportSnapshot *p_snapshot) {
 	if (p_viewport->measure_render_time) {
 		String rt_id = "vp_begin_" + itos(p_viewport->self.get_id());
 		RSG::utilities->capture_timestamp(rt_id);
@@ -386,21 +411,41 @@ void RendererViewport::_draw_viewport(Viewport *p_viewport) {
 		}
 	}
 
-	if (RSG::scene->is_scenario(p_viewport->scenario)) {
-		RID environment = RSG::scene->scenario_get_environment(p_viewport->scenario);
-		if (RSG::scene->is_environment(environment)) {
-			if (can_draw_2d && !viewport_is_environment_disabled(p_viewport)) {
-				scenario_draw_canvas_bg = RSG::scene->environment_get_background(environment) == RSE::ENV_BG_CANVAS;
-				scenario_canvas_max_layer = RSG::scene->environment_get_canvas_max_layer(environment);
-			} else if (RSG::scene->environment_get_background(environment) == RSE::ENV_BG_CANVAS) {
-				// The scene renderer will still copy over the last frame, so we need to clear the render target.
-				force_clear_render_target = true;
+	bool can_draw_3d = false;
+	bool is_scenario = false;
+	DisplayServerEnums::WindowID parent_window = DisplayServerEnums::INVALID_WINDOW_ID;
+#ifdef MACRAME_ENABLED
+	if (p_snapshot) {
+		// The cull node's decisions: nothing of the scene is read here.
+		is_scenario = p_snapshot->is_scenario;
+		scenario_draw_canvas_bg = p_snapshot->scenario_draw_canvas_bg;
+		scenario_canvas_max_layer = p_snapshot->scenario_canvas_max_layer;
+		force_clear_render_target = p_snapshot->force_clear_render_target;
+		can_draw_3d = p_snapshot->can_draw_3d;
+		parent_window = p_snapshot->window;
+	} else
+#endif
+	{
+		is_scenario = RSG::scene->is_scenario(p_viewport->scenario);
+		if (is_scenario) {
+			RID environment = RSG::scene->scenario_get_environment(p_viewport->scenario);
+			if (RSG::scene->is_environment(environment)) {
+				if (can_draw_2d && !viewport_is_environment_disabled(p_viewport)) {
+					scenario_draw_canvas_bg = RSG::scene->environment_get_background(environment) == RSE::ENV_BG_CANVAS;
+					scenario_canvas_max_layer = RSG::scene->environment_get_canvas_max_layer(environment);
+				} else if (RSG::scene->environment_get_background(environment) == RSE::ENV_BG_CANVAS) {
+					// The scene renderer will still copy over the last frame, so we need to clear the render target.
+					force_clear_render_target = true;
+				}
 			}
+			parent_window = _get_containing_window(p_viewport);
 		}
+		can_draw_3d = RSG::scene->is_camera(p_viewport->camera) && !p_viewport->disable_3d;
+	}
 
+	if (is_scenario) {
 		p_viewport->window_output_max_value = 1.0;
 #ifdef RD_ENABLED
-		DisplayServerEnums::WindowID parent_window = _get_containing_window(p_viewport);
 		if (RD::get_singleton() && parent_window != DisplayServerEnums::INVALID_WINDOW_ID) {
 			RenderingContextDriver *context_driver = RD::get_singleton()->get_context_driver();
 			if (context_driver->window_get_hdr_output_enabled(parent_window)) {
@@ -410,13 +455,21 @@ void RendererViewport::_draw_viewport(Viewport *p_viewport) {
 #endif
 	}
 
-	bool can_draw_3d = RSG::scene->is_camera(p_viewport->camera) && !p_viewport->disable_3d;
-
 	if ((scenario_draw_canvas_bg || can_draw_3d) && !p_viewport->render_buffers.is_valid()) {
-		//wants to draw 3D but there is no render buffer, create
-		p_viewport->render_buffers = RSG::scene->render_buffers_create();
+#ifdef MACRAME_ENABLED
+		if (p_snapshot) {
+			// The scene update makes them (`macrame_update_head`), before the cull of the frame
+			// that draws with them; a copy without buffers draws no 3D this frame.
+			scenario_draw_canvas_bg = false;
+			can_draw_3d = false;
+		} else
+#endif
+		{
+			//wants to draw 3D but there is no render buffer, create
+			p_viewport->render_buffers = RSG::scene->render_buffers_create();
 
-		_configure_3d_render_buffers(p_viewport);
+			_configure_3d_render_buffers(p_viewport);
+		}
 	}
 
 	Color bgcolor = p_viewport->transparent_bg ? Color(0, 0, 0, 0) : RSG::texture_storage->get_default_clear_color();
@@ -432,7 +485,7 @@ void RendererViewport::_draw_viewport(Viewport *p_viewport) {
 		if (force_clear_render_target) {
 			RSG::texture_storage->render_target_do_clear_request(p_viewport->render_target);
 		}
-		_draw_3d(p_viewport);
+		_draw_3d(p_viewport, p_snapshot);
 	}
 
 	if (can_draw_2d) {
@@ -445,7 +498,13 @@ void RendererViewport::_draw_viewport(Viewport *p_viewport) {
 		RendererCanvasRender::Light *directional_lights = nullptr;
 		RendererCanvasRender::Light *directional_lights_with_shadow = nullptr;
 
-		if (p_viewport->sdf_active) {
+#ifdef MACRAME_ENABLED
+		// The record node's own flag: set by the canvas draw, read here, never by the scene update.
+		bool &sdf_active = p_snapshot ? macrame_record_state[p_viewport->self].sdf_active : p_viewport->sdf_active;
+#else
+		bool &sdf_active = p_viewport->sdf_active;
+#endif
+		if (sdf_active) {
 			// Process SDF.
 
 			Rect2 sdf_rect = RSG::texture_storage->render_target_get_sdf_rect(p_viewport->render_target);
@@ -480,7 +539,7 @@ void RendererViewport::_draw_viewport(Viewport *p_viewport) {
 			RSG::canvas_render->render_sdf(p_viewport->render_target, occluders);
 			RSG::texture_storage->render_target_mark_sdf_enabled(p_viewport->render_target, true);
 
-			p_viewport->sdf_active = false; // If used, gets set active again.
+			sdf_active = false; // If used, gets set active again.
 		} else {
 			RSG::texture_storage->render_target_mark_sdf_enabled(p_viewport->render_target, false);
 		}
@@ -705,7 +764,7 @@ void RendererViewport::_draw_viewport(Viewport *p_viewport) {
 			if (!can_draw_3d) {
 				RSG::scene->render_empty_scene(p_viewport->render_buffers, p_viewport->scenario, p_viewport->shadow_atlas, p_viewport->window_output_max_value);
 			} else {
-				_draw_3d(p_viewport);
+				_draw_3d(p_viewport, p_snapshot);
 			}
 			scenario_draw_canvas_bg = false;
 		}
@@ -744,7 +803,7 @@ void RendererViewport::_draw_viewport(Viewport *p_viewport) {
 			RENDER_TIMESTAMP("< Render Canvas " + itos(canvas_idx));
 
 			if (RSG::canvas->was_sdf_used()) {
-				p_viewport->sdf_active = true;
+				sdf_active = true;
 			}
 
 			if (scenario_draw_canvas_bg && E.key.get_layer() >= scenario_canvas_max_layer) {
@@ -754,7 +813,7 @@ void RendererViewport::_draw_viewport(Viewport *p_viewport) {
 				if (!can_draw_3d) {
 					RSG::scene->render_empty_scene(p_viewport->render_buffers, p_viewport->scenario, p_viewport->shadow_atlas, p_viewport->window_output_max_value);
 				} else {
-					_draw_3d(p_viewport);
+					_draw_3d(p_viewport, p_snapshot);
 				}
 
 				scenario_draw_canvas_bg = false;
@@ -770,7 +829,7 @@ void RendererViewport::_draw_viewport(Viewport *p_viewport) {
 			if (!can_draw_3d) {
 				RSG::scene->render_empty_scene(p_viewport->render_buffers, p_viewport->scenario, p_viewport->shadow_atlas, p_viewport->window_output_max_value);
 			} else {
-				_draw_3d(p_viewport);
+				_draw_3d(p_viewport, p_snapshot);
 			}
 		}
 	}
@@ -811,72 +870,256 @@ DisplayServerEnums::WindowID RendererViewport::_get_containing_window(Viewport *
 void RendererViewport::macrame_cull_viewports(MacrameRenderLists &r_lists) {
 	GodotProfileZone("cull viewports");
 	r_lists.entries.clear();
+	r_lists.clear_jobs();
+	CRASH_COND_MSG(sorted_active_viewports_dirty, "Macrame: the viewport order is dirty at cull time (the scene update sorts it at its head).");
+	// The same visibility rules as `draw_viewports`, without its side effects: a parent's
+	// visibility comes from this pass, kept here.
+	HashMap<RID, bool> visible_now;
+	for (int i = sorted_active_viewports.size() - 1; i >= 0; i--) {
+		Viewport *vp = sorted_active_viewports[i];
+		bool visible = false;
+		if (vp->update_mode != RSE::VIEWPORT_UPDATE_DISABLED && vp->render_target.is_valid()) {
+			visible = vp->viewport_to_screen_rect != Rect2();
+			if (vp->use_xr) {
+				visible = false; // The three-node pipeline does not draw XR viewports (the record node would cull beside the scene update); they fault there if listed.
+			} else {
+				if (vp->update_mode == RSE::VIEWPORT_UPDATE_ALWAYS || vp->update_mode == RSE::VIEWPORT_UPDATE_ONCE) {
+					visible = true;
+				}
+				if (vp->update_mode == RSE::VIEWPORT_UPDATE_WHEN_VISIBLE && RSG::texture_storage->render_target_was_used(vp->render_target)) {
+					visible = true;
+				}
+				if (vp->update_mode == RSE::VIEWPORT_UPDATE_WHEN_PARENT_VISIBLE) {
+					const bool *parent_visible = visible_now.getptr(vp->parent);
+					if (parent_visible && *parent_visible) {
+						visible = true;
+					}
+				}
+			}
+			visible = visible && vp->size.x > 1 && vp->size.y > 1 && vp->view_count > 0;
+		}
+		visible_now[vp->self] = visible;
+	}
+	uint32_t used = 0;
+	uint32_t snapshots = 0;
+	for (int i = 0; i < sorted_active_viewports.size(); i++) {
+		Viewport *vp = sorted_active_viewports[i];
+		if (!visible_now[vp->self]) {
+			continue;
+		}
+		MacrameViewportSnapshot *snap = macrame_snapshot_acquire(r_lists, snapshots++);
+		snap->view = *vp; // The copy the record node draws from.
+		snap->window = _get_containing_window(vp);
+		snap->environment_disabled = viewport_is_environment_disabled(vp);
+		snap->scenario_draw_canvas_bg = false;
+		snap->scenario_canvas_max_layer = 0;
+		snap->force_clear_render_target = false;
+		snap->is_scenario = RSG::scene->is_scenario(vp->scenario);
+		snap->can_draw_3d = RSG::scene->is_camera(vp->camera) && !vp->disable_3d;
+		const bool can_draw_2d = !vp->disable_2d && vp->view_count == 1;
+		if (snap->is_scenario) {
+			RID environment = RSG::scene->scenario_get_environment(vp->scenario);
+			if (RSG::scene->is_environment(environment)) {
+				if (can_draw_2d && !snap->environment_disabled) {
+					snap->scenario_draw_canvas_bg = RSG::scene->environment_get_background(environment) == RSE::ENV_BG_CANVAS;
+					snap->scenario_canvas_max_layer = RSG::scene->environment_get_canvas_max_layer(environment);
+				} else if (RSG::scene->environment_get_background(environment) == RSE::ENV_BG_CANVAS) {
+					snap->force_clear_render_target = true;
+				}
+			}
+		}
+		MacrameRenderLists::ViewportEntry ve;
+		ve.viewport = vp->self;
+		ve.snapshot = snap;
+		// The 3D part, whichever way `_draw_viewport` reaches `_draw_3d` (directly, or behind a
+		// canvas background). Buffers a viewport still lacks are the scene update's to make
+		// (`macrame_update_head`): the copy draws no 3D until then.
+		if (snap->can_draw_3d && vp->render_buffers.is_valid()) {
+			RenderSceneCullFrame *frame = r_lists.acquire(RSG::scene, used);
+			if (frame) {
+				used++;
+				float screen_mesh_lod_threshold = vp->mesh_lod_threshold / float(vp->size.width);
+				Ref<XRInterface> no_xr;
+				MACRAME_PHASE("cull: viewport select");
+				RSG::scene->cull_camera(frame, vp->render_buffers, vp->camera, vp->scenario, vp->self, vp->internal_size, vp->jitter_phase_count, screen_mesh_lod_threshold, vp->shadow_atlas, no_xr, vp->window_output_max_value, &vp->render_info);
+				RSG::scene->cull_frame_set_number(frame, r_lists.frame_number);
+				MacrameRenderLists::Entry e;
+				e.viewport = vp->self;
+				e.frame = frame;
+				r_lists.entries.push_back(e);
+				ve.frame = frame;
+			}
+		}
+		r_lists.viewports.push_back(ve);
+	}
+	r_lists.frames_used = used;
+}
+
+MacrameViewportSnapshot *RendererViewport::macrame_snapshot_acquire(MacrameRenderLists &r_lists, uint32_t p_index) {
+	while (p_index >= r_lists.snapshot_pool.size()) {
+		r_lists.snapshot_pool.push_back(memnew(MacrameViewportSnapshot));
+	}
+	return r_lists.snapshot_pool[p_index];
+}
+
+void RendererViewport::macrame_snapshots_release(MacrameRenderLists &r_lists) {
+	r_lists.viewports.clear();
+	for (MacrameViewportSnapshot *s : r_lists.snapshot_pool) {
+		memdelete(s);
+	}
+	r_lists.snapshot_pool.clear();
+}
+
+// The scene update, at its head: what the viewports learn from the last record, the frees that
+// waited, the order the cull and the record walk, and the buffers a viewport wants.
+void RendererViewport::macrame_update_head() {
+	macrame_viewport_results.drain([this](const MacrameViewportResult &r) { macrame_apply_result(r); });
+	macrame_viewport_frees.apply([this](RID p_rid) {
+		Viewport *vp = viewport_owner.get_or_null(p_rid);
+		if (vp) {
+			_macrame_free_viewport_now(vp, p_rid);
+		}
+	});
 	if (sorted_active_viewports_dirty) {
 		sorted_active_viewports = _sort_active_viewports();
 		sorted_active_viewports_dirty = false;
 	}
-	// The same visibility rules as `draw_viewports`, without its side effects (`last_pass`,
-	// `draw_viewports_pass`): a parent's visibility is read from the last draw.
-	uint32_t used = 0;
-	for (int i = 0; i < sorted_active_viewports.size(); i++) {
-		Viewport *vp = sorted_active_viewports[i];
-		if (vp->update_mode == RSE::VIEWPORT_UPDATE_DISABLED || !vp->render_target.is_valid()) {
+	for (Viewport *vp : active_viewports) {
+		if (vp->use_occlusion_culling && vp->occlusion_buffer_dirty && vp->size.width > 0 && vp->size.height > 0) {
+			_macrame_size_occlusion_buffer(vp);
+		}
+		if (vp->render_buffers.is_valid() || vp->size.width == 0 || vp->size.height == 0) {
 			continue;
 		}
-		bool visible = vp->viewport_to_screen_rect != Rect2();
-		if (vp->use_xr) {
-			continue; // XR viewports take the combined path.
-		}
-		if (vp->update_mode == RSE::VIEWPORT_UPDATE_ALWAYS || vp->update_mode == RSE::VIEWPORT_UPDATE_ONCE) {
-			visible = true;
-		}
-		if (vp->update_mode == RSE::VIEWPORT_UPDATE_WHEN_VISIBLE && RSG::texture_storage->render_target_was_used(vp->render_target)) {
-			visible = true;
-		}
-		if (vp->update_mode == RSE::VIEWPORT_UPDATE_WHEN_PARENT_VISIBLE) {
-			Viewport *parent = viewport_owner.get_or_null(vp->parent);
-			if (parent && parent->last_pass == draw_viewports_pass) {
-				visible = true;
-			}
-		}
-		visible = visible && vp->size.x > 1 && vp->size.y > 1 && vp->view_count > 0;
-		if (!visible) {
-			continue;
-		}
-		if (vp->disable_3d || !RSG::scene->is_camera(vp->camera) || !vp->render_buffers.is_valid()) {
-			continue; // No 3D, or the record node still has to create the buffers: combined path.
-		}
-		if (RSG::scene->is_scenario(vp->scenario)) {
+		bool wants_3d = RSG::scene->is_camera(vp->camera) && !vp->disable_3d;
+		if (!wants_3d && RSG::scene->is_scenario(vp->scenario)) {
 			RID environment = RSG::scene->scenario_get_environment(vp->scenario);
-			bool can_draw_2d = !vp->disable_2d && vp->view_count == 1;
+			const bool can_draw_2d = !vp->disable_2d && vp->view_count == 1;
 			if (RSG::scene->is_environment(environment) && can_draw_2d && !viewport_is_environment_disabled(vp) && RSG::scene->environment_get_background(environment) == RSE::ENV_BG_CANVAS) {
-				continue; // Canvas background: `_draw_viewport` draws no 3D for it.
+				wants_3d = true; // A canvas background draws the 3D scene behind it.
 			}
 		}
-		RenderSceneCullFrame *frame = r_lists.acquire(RSG::scene, used);
-		if (!frame) {
-			return; // The scene renderer does not split.
+		if (wants_3d) {
+			vp->render_buffers = RSG::scene->render_buffers_create();
+			_configure_3d_render_buffers(vp);
 		}
-		used++;
-		if (vp->use_occlusion_culling && vp->occlusion_buffer_dirty) {
-			float aspect = vp->size.aspect();
-			int max_size = occlusion_rays_per_thread * WorkerThreadPool::get_singleton()->get_thread_count();
-			int viewport_size = vp->size.width * vp->size.height;
-			max_size = CLAMP(max_size, viewport_size / (32 * 32), viewport_size / (2 * 2));
-			float height = Math::sqrt(max_size / aspect);
-			Size2i new_size = Size2i(height * aspect, height);
-			RendererSceneOcclusionCull::get_singleton()->buffer_set_size(vp->self, new_size);
-			vp->occlusion_buffer_dirty = false;
+	}
+}
+
+void RendererViewport::macrame_apply_result(const MacrameViewportResult &r) {
+	Viewport *vp = viewport_owner.get_or_null(r.viewport);
+	if (!vp) {
+		return;
+	}
+	if (r.update_once_done && vp->update_mode == RSE::VIEWPORT_UPDATE_ONCE) {
+		vp->update_mode = RSE::VIEWPORT_UPDATE_DISABLED;
+	}
+	if (r.clear_next_frame_spent && vp->clear_mode == RSE::VIEWPORT_CLEAR_ONLY_NEXT_FRAME) {
+		vp->clear_mode = RSE::VIEWPORT_CLEAR_NEVER;
+	}
+	vp->window_output_max_value = r.window_output_max_value;
+	vp->render_info = r.render_info;
+	vp->time_cpu_begin = r.time_cpu_begin;
+	vp->time_cpu_end = r.time_cpu_end;
+	vp->time_gpu_begin = r.time_gpu_begin;
+	vp->time_gpu_end = r.time_gpu_end;
+}
+
+void RendererViewport::_macrame_free_viewport_now(Viewport *p_viewport, RID p_rid) {
+	RSG::texture_storage->render_target_free(p_viewport->render_target);
+	RSG::light_storage->shadow_atlas_free(p_viewport->shadow_atlas);
+	if (p_viewport->render_buffers.is_valid()) {
+		p_viewport->render_buffers.unref();
+	}
+	while (p_viewport->canvas_map.begin()) {
+		viewport_remove_canvas(p_rid, p_viewport->canvas_map.begin()->key);
+	}
+	viewport_set_scenario(p_rid, RID());
+	if (p_viewport->use_occlusion_culling) {
+		RendererSceneOcclusionCull::get_singleton()->remove_buffer(p_rid);
+	}
+	if (_viewport_requires_motion_vectors(p_viewport)) {
+		num_viewports_with_motion_vectors--;
+	}
+	viewport_owner.free(p_rid);
+}
+
+// The record node of the three-node pipeline: `draw_viewports` over the cull's copies.
+void RendererViewport::_macrame_draw_viewports_from_lists(bool p_swap_buffers) {
+	GodotProfileZoneGroupedFirst(_profile_zone, "render viewports");
+	HashMap<DisplayServerEnums::WindowID, Vector<RenderingServerTypes::BlitToScreen>> blit_to_screen_list;
+	RENDER_TIMESTAMP("> Render Viewports");
+	int vertices_drawn = 0;
+	int objects_drawn = 0;
+	int draw_calls_used = 0;
+	int i = 0;
+	for (const MacrameRenderLists::ViewportEntry &ve : record_lists->viewports) {
+		GodotProfileZone("render viewport");
+		Viewport *vp = &ve.snapshot->view;
+		CRASH_COND_MSG(vp->use_xr, "Macrame: an XR viewport reached the record node; the three-node render pipeline does not draw XR (MACRAME_RENDER_SPLIT=0).");
+		RENDER_TIMESTAMP("> Render Viewport " + itos(i));
+		RSG::texture_storage->render_target_set_as_unused(vp->render_target);
+		RSG::scene->set_debug_draw_mode(vp->debug_draw);
+		const RSE::ViewportClearMode clear_mode_before = vp->clear_mode;
+		_draw_viewport(vp, ve.snapshot);
+		if (vp->viewport_to_screen != DisplayServerEnums::INVALID_WINDOW_ID && (!vp->viewport_render_direct_to_screen || !RSG::rasterizer->is_low_end())) {
+			RenderingServerTypes::BlitToScreen blit;
+			blit.render_target = vp->render_target;
+			if (vp->viewport_to_screen_rect != Rect2()) {
+				blit.dst_rect = vp->viewport_to_screen_rect;
+			} else {
+				blit.dst_rect.position = Vector2();
+				blit.dst_rect.size = vp->size;
+			}
+			if (RSG::rasterizer->is_opengl()) {
+				RSG::rasterizer->blit_render_targets_to_screen(vp->viewport_to_screen, &blit, 1);
+				RSG::rasterizer->gl_end_frame(p_swap_buffers);
+			} else {
+				Vector<RenderingServerTypes::BlitToScreen> *blits = blit_to_screen_list.getptr(vp->viewport_to_screen);
+				if (blits == nullptr) {
+					blits = &blit_to_screen_list.insert(vp->viewport_to_screen, Vector<RenderingServerTypes::BlitToScreen>())->value;
+				}
+				blits->push_back(blit);
+			}
 		}
-		float screen_mesh_lod_threshold = vp->mesh_lod_threshold / float(vp->size.width);
-		Ref<XRInterface> no_xr;
-		MACRAME_PHASE("cull: viewport select");
-		RSG::scene->cull_camera(frame, vp->render_buffers, vp->camera, vp->scenario, vp->self, vp->internal_size, vp->jitter_phase_count, screen_mesh_lod_threshold, vp->shadow_atlas, no_xr, vp->window_output_max_value, &vp->render_info);
-		RSG::scene->cull_frame_set_number(frame, r_lists.frame_number);
-		MacrameRenderLists::Entry e;
-		e.viewport = vp->self;
-		e.frame = frame;
-		r_lists.entries.push_back(e);
+		RENDER_TIMESTAMP("< Render Viewport " + itos(i));
+		objects_drawn += vp->render_info.info[RSE::VIEWPORT_RENDER_INFO_TYPE_VISIBLE][RSE::VIEWPORT_RENDER_INFO_OBJECTS_IN_FRAME] + vp->render_info.info[RSE::VIEWPORT_RENDER_INFO_TYPE_SHADOW][RSE::VIEWPORT_RENDER_INFO_OBJECTS_IN_FRAME];
+		vertices_drawn += vp->render_info.info[RSE::VIEWPORT_RENDER_INFO_TYPE_VISIBLE][RSE::VIEWPORT_RENDER_INFO_PRIMITIVES_IN_FRAME] + vp->render_info.info[RSE::VIEWPORT_RENDER_INFO_TYPE_SHADOW][RSE::VIEWPORT_RENDER_INFO_PRIMITIVES_IN_FRAME];
+		draw_calls_used += vp->render_info.info[RSE::VIEWPORT_RENDER_INFO_TYPE_VISIBLE][RSE::VIEWPORT_RENDER_INFO_DRAW_CALLS_IN_FRAME] + vp->render_info.info[RSE::VIEWPORT_RENDER_INFO_TYPE_SHADOW][RSE::VIEWPORT_RENDER_INFO_DRAW_CALLS_IN_FRAME];
+		objects_drawn += vp->render_info.info[RSE::VIEWPORT_RENDER_INFO_TYPE_CANVAS][RSE::VIEWPORT_RENDER_INFO_OBJECTS_IN_FRAME];
+		vertices_drawn += vp->render_info.info[RSE::VIEWPORT_RENDER_INFO_TYPE_CANVAS][RSE::VIEWPORT_RENDER_INFO_PRIMITIVES_IN_FRAME];
+		draw_calls_used += vp->render_info.info[RSE::VIEWPORT_RENDER_INFO_TYPE_CANVAS][RSE::VIEWPORT_RENDER_INFO_DRAW_CALLS_IN_FRAME];
+		// What the viewport learns from this draw, to its owner.
+		MacrameViewportResult r;
+		r.viewport = ve.viewport;
+		r.update_once_done = vp->update_mode == RSE::VIEWPORT_UPDATE_ONCE;
+		r.clear_next_frame_spent = clear_mode_before == RSE::VIEWPORT_CLEAR_ONLY_NEXT_FRAME;
+		r.window_output_max_value = vp->window_output_max_value;
+		r.render_info = vp->render_info;
+		const MacrameRecordState *rs = macrame_record_state.getptr(ve.viewport);
+		if (rs) {
+			r.time_cpu_begin = rs->time_cpu_begin;
+			r.time_cpu_end = rs->time_cpu_end;
+			r.time_gpu_begin = rs->time_gpu_begin;
+			r.time_gpu_end = rs->time_gpu_end;
+		}
+		if (MacrameRunParity::on_record_node()) {
+			macrame_viewport_results.add(r);
+		} else {
+			macrame_apply_result(r); // One body holds every grant: the viewport is its.
+		}
+		i++;
+	}
+	RSG::scene->set_debug_draw_mode(RSE::VIEWPORT_DEBUG_DRAW_DISABLED);
+	total_objects_drawn = objects_drawn;
+	total_vertices_drawn = vertices_drawn;
+	total_draw_calls_used = draw_calls_used;
+	RENDER_TIMESTAMP("< Render Viewports");
+	GodotProfileZoneGrouped(_profile_zone, "rasterizer->blit_render_targets_to_screen");
+	if (p_swap_buffers && !blit_to_screen_list.is_empty()) {
+		for (const KeyValue<int, Vector<RenderingServerTypes::BlitToScreen>> &E : blit_to_screen_list) {
+			RSG::rasterizer->blit_render_targets_to_screen(E.key, E.value.ptr(), E.value.size());
+		}
 	}
 }
 #endif
@@ -884,6 +1127,12 @@ void RendererViewport::macrame_cull_viewports(MacrameRenderLists &r_lists) {
 void RendererViewport::draw_viewports(bool p_swap_buffers) {
 	GodotProfileZoneGroupedFirst(_profile_zone, "prepare viewports");
 	timestamp_vp_map.clear();
+#ifdef MACRAME_ENABLED
+	if (record_lists) {
+		_macrame_draw_viewports_from_lists(p_swap_buffers);
+		return;
+	}
+#endif
 
 #ifndef XR_DISABLED
 	// get our xr interface in case we need it
@@ -1688,6 +1937,25 @@ float RendererViewport::viewport_get_measured_render_time_cpu(RID p_viewport) co
 void RendererViewport::macrame_collect_outputs(MacrameRenderOutputs &r_outputs) const {
 	static_assert(MacrameRenderOutputs::RENDER_INFO_TYPES == RSE::VIEWPORT_RENDER_INFO_TYPE_MAX);
 	static_assert(MacrameRenderOutputs::RENDER_INFOS == RSE::VIEWPORT_RENDER_INFO_MAX);
+	if (record_lists) {
+		// The three-node shapes: the copies this record drew, and the record node's own timestamps.
+		for (const MacrameRenderLists::ViewportEntry &ve : record_lists->viewports) {
+			const Viewport *viewport = &ve.snapshot->view;
+			MacrameRenderOutputs::ViewportStats stats;
+			const MacrameRecordState *rs = macrame_record_state.getptr(ve.viewport);
+			if (rs) {
+				stats.time_cpu = double(rs->time_cpu_end - rs->time_cpu_begin) / 1000.0;
+				stats.time_gpu = double((rs->time_gpu_end - rs->time_gpu_begin) / 1000) / 1000.0;
+			}
+			for (int t = 0; t < RSE::VIEWPORT_RENDER_INFO_TYPE_MAX; t++) {
+				for (int i = 0; i < RSE::VIEWPORT_RENDER_INFO_MAX; i++) {
+					stats.render_info[t][i] = viewport->render_info.info[t][i];
+				}
+			}
+			r_outputs.viewports.insert(ve.viewport, stats);
+		}
+		return;
+	}
 	for (const Viewport *viewport : active_viewports) {
 		MacrameRenderOutputs::ViewportStats stats;
 		stats.time_cpu = double(viewport->time_cpu_end - viewport->time_cpu_begin) / 1000.0;
@@ -1783,6 +2051,17 @@ void RendererViewport::viewport_set_vrs_texture(RID p_viewport, RID p_texture) {
 bool RendererViewport::free(RID p_rid) {
 	if (viewport_owner.owns(p_rid)) {
 		Viewport *viewport = viewport_owner.get_or_null(p_rid);
+#ifdef MACRAME_ENABLED
+		if (MacrameRunParity::defers_frees()) {
+			// The scene update: the record node of this run may be drawing the cull's copy of it
+			// (its render target, its canvases). Out of the active list now, so no later cull
+			// copies it; destroyed at the scene update's head two runs later.
+			active_viewports.erase(viewport);
+			sorted_active_viewports_dirty = true;
+			macrame_viewport_frees.defer(p_rid);
+			return true;
+		}
+#endif
 
 		RSG::texture_storage->render_target_free(viewport->render_target);
 		RSG::light_storage->shadow_atlas_free(viewport->shadow_atlas);
@@ -1820,6 +2099,20 @@ void RendererViewport::handle_timestamp(String p_timestamp, uint64_t p_cpu_time,
 		return;
 	}
 
+#ifdef MACRAME_ENABLED
+	if (MacrameRunParity::on_record_node()) {
+		MacrameRecordState &rs = macrame_record_state[*vp];
+		if (p_timestamp.begins_with("vp_begin")) {
+			rs.time_cpu_begin = p_cpu_time;
+			rs.time_gpu_begin = p_gpu_time;
+		}
+		if (p_timestamp.begins_with("vp_end")) {
+			rs.time_cpu_end = p_cpu_time;
+			rs.time_gpu_end = p_gpu_time;
+		}
+		return;
+	}
+#endif
 	Viewport *viewport = viewport_owner.get_or_null(*vp);
 	if (!viewport) {
 		return;

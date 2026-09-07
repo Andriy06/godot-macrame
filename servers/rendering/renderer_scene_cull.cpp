@@ -2200,7 +2200,7 @@ void RendererSceneCull::_light_instance_setup_directional_shadow(RenderSceneCull
 
 	distances[splits] = max_distance;
 
-	real_t texture_size = RSG::light_storage->get_directional_light_shadow_size(light->instance);
+	real_t texture_size = RSG::light_storage->get_directional_light_shadow_size(light->instance, p_frame.directional_shadow_count); // The frame's count, not the storage's (the record node's).
 
 	bool overlap = RSG::light_storage->light_directional_get_blend_splits(p_instance->base);
 
@@ -2929,7 +2929,9 @@ void RendererSceneCull::macrame_device_update() {
 	// The device side of `update()`: uploads of dirty resources and the collider renders.
 	RSG::utilities->update_dirty_resources();
 	MACRAME_PHASE("su: dirty resources (uploads)");
-	render_particle_colliders();
+	if (!macrame_record_lists) {
+		render_particle_colliders(); // The three-node shapes draw them as jobs (`_macrame_draw_jobs`).
+	}
 	MACRAME_PHASE("su: particle colliders");
 }
 
@@ -3080,15 +3082,23 @@ void RendererSceneCull::_scene_cull(CullData &cull_data, InstanceCullResult &cul
 						//avoid entering The Matrix
 
 						if ((idata.flags & InstanceData::FLAG_REFLECTION_PROBE_DIRTY) || RSG::light_storage->reflection_probe_instance_needs_redraw(RID::from_uint64(idata.instance_data_rid))) {
-							InstanceReflectionProbeData *reflection_probe = static_cast<InstanceReflectionProbeData *>(idata.instance->base_data);
-							cull_data.cull->lock.lock();
-							if (!reflection_probe->update_list.in_list()) {
-								reflection_probe->render_step = 0;
-								reflection_probe_render_list.add_last(&reflection_probe->update_list);
-							}
-							cull_data.cull->lock.unlock();
+#ifdef MACRAME_ENABLED
+							if (MacrameRunParity::on_cull_node()) {
+								// The render list and the flag are the scene update's: by mailbox (`macrame_update_head`).
+								cull_result.probe_redraws.push_back(idata.instance->self);
+							} else
+#endif
+							{
+								InstanceReflectionProbeData *reflection_probe = static_cast<InstanceReflectionProbeData *>(idata.instance->base_data);
+								cull_data.cull->lock.lock();
+								if (!reflection_probe->update_list.in_list()) {
+									reflection_probe->render_step = 0;
+									reflection_probe_render_list.add_last(&reflection_probe->update_list);
+								}
+								cull_data.cull->lock.unlock();
 
-							idata.flags &= ~InstanceData::FLAG_REFLECTION_PROBE_DIRTY;
+								idata.flags &= ~InstanceData::FLAG_REFLECTION_PROBE_DIRTY;
+							}
 						}
 
 						if (RSG::light_storage->reflection_probe_instance_has_reflection(RID::from_uint64(idata.instance_data_rid))) {
@@ -3099,12 +3109,19 @@ void RendererSceneCull::_scene_cull(CullData &cull_data, InstanceCullResult &cul
 					cull_result.decals.push_back(RID::from_uint64(idata.instance_data_rid));
 
 				} else if (base_type == RSE::INSTANCE_VOXEL_GI) {
-					InstanceVoxelGIData *voxel_gi = static_cast<InstanceVoxelGIData *>(idata.instance->base_data);
-					cull_data.cull->lock.lock();
-					if (!voxel_gi->update_element.in_list()) {
-						voxel_gi_update_list.add(&voxel_gi->update_element);
+#ifdef MACRAME_ENABLED
+					if (MacrameRunParity::on_cull_node()) {
+						cull_result.voxel_gi_updates.push_back(idata.instance->self); // The update list is the scene update's.
+					} else
+#endif
+					{
+						InstanceVoxelGIData *voxel_gi = static_cast<InstanceVoxelGIData *>(idata.instance->base_data);
+						cull_data.cull->lock.lock();
+						if (!voxel_gi->update_element.in_list()) {
+							voxel_gi_update_list.add(&voxel_gi->update_element);
+						}
+						cull_data.cull->lock.unlock();
 					}
-					cull_data.cull->lock.unlock();
 					cull_result.voxel_gi_instances.push_back(RID::from_uint64(idata.instance_data_rid));
 
 				} else if (base_type == RSE::INSTANCE_LIGHTMAP) {
@@ -3556,7 +3573,7 @@ void RendererSceneCull::_cull_scene(RenderSceneCullFrame &p_frame, const Rendere
 			}
 		}
 
-		RSG::light_storage->set_directional_shadow_count(lights_with_shadow.size());
+		// The storage's count is the record node's: `_draw_culled_scene` sets it from the frame.
 		p_frame.directional_shadow_count = lights_with_shadow.size();
 
 		for (int i = 0; i < lights_with_shadow.size(); i++) {
@@ -4107,6 +4124,15 @@ bool RendererSceneCull::_render_reflection_probe_step(Instance *p_instance, int 
 }
 
 void RendererSceneCull::render_probes() {
+#ifdef MACRAME_ENABLED
+	if (macrame_record_lists) {
+		// The record node of the three-node pipeline: the cull node prepared the probe faces, the
+		// voxel GI geometry and the collider heightfields into the lists; nothing of the scene is
+		// read here.
+		_macrame_draw_jobs(*macrame_record_lists);
+		return;
+	}
+#endif
 	/* REFLECTION PROBES */
 
 	SelfList<InstanceReflectionProbeData> *ref_probe = reflection_probe_render_list.first();
@@ -4169,10 +4195,22 @@ void RendererSceneCull::render_probes() {
 		SelfList<InstanceVoxelGIData> *next = voxel_gi->next();
 
 		InstanceVoxelGIData *probe = voxel_gi->self();
-		//Instance *instance_probe = probe->owner;
+		const bool update_lights = _voxel_gi_prepare(probe);
+		scratch_frame->cull_result.geometry_instances.clear();
+		_voxel_gi_collect_dynamic(probe, scratch_frame->cull_result.geometry_instances);
 
-		//check if probe must be setup, but don't do if on the lighting thread
+		scene_render->voxel_gi_update(probe->probe_instance, update_lights, probe->light_instances, scratch_frame->cull_result.geometry_instances);
 
+		voxel_gi_update_list.remove(voxel_gi);
+
+		voxel_gi = next;
+	}
+}
+
+// The scene's half of a voxel GI update: the light cache (rebuilt when a light in it changed) and
+// the pairing of the dynamic geometry in view whose voxel GI list changed. Writes the probe and
+// the instances' flags, so it belongs to the scene update.
+bool RendererSceneCull::_voxel_gi_prepare(InstanceVoxelGIData *probe) {
 		bool cache_dirty = false;
 		int cache_count = 0;
 		{
@@ -4323,43 +4361,44 @@ void RendererSceneCull::render_probes() {
 			update_lights = true;
 		}
 
-		scratch_frame->cull_result.geometry_instances.clear();
 
-		RID instance_pair_buffer[MAX_INSTANCE_PAIRS];
-
-		for (Instance *E : probe->dynamic_geometries) {
-			Instance *ins = E;
-			if (!ins->visible) {
-				continue;
-			}
-			InstanceGeometryData *geom = (InstanceGeometryData *)ins->base_data;
-
-			if (ins->scenario && ins->array_index >= 0 && (ins->scenario->instance_data[ins->array_index].flags & InstanceData::FLAG_GEOM_VOXEL_GI_DIRTY)) {
-				uint32_t idx = 0;
-				for (const Instance *F : geom->voxel_gi_instances) {
-					InstanceVoxelGIData *voxel_gi2 = static_cast<InstanceVoxelGIData *>(F->base_data);
-
-					instance_pair_buffer[idx++] = voxel_gi2->probe_instance;
-					if (idx == MAX_INSTANCE_PAIRS) {
-						break;
-					}
-				}
-
-				ERR_FAIL_NULL(geom->geometry_instance);
-				geom->geometry_instance->pair_voxel_gi_instances(instance_pair_buffer, idx);
-
-				ins->scenario->instance_data[ins->array_index].flags &= ~InstanceData::FLAG_GEOM_VOXEL_GI_DIRTY;
-			}
-
-			ERR_FAIL_NULL(geom->geometry_instance);
-			scratch_frame->cull_result.geometry_instances.push_back(geom->geometry_instance);
+	RID instance_pair_buffer[MAX_INSTANCE_PAIRS];
+	for (Instance *E : probe->dynamic_geometries) {
+		Instance *ins = E;
+		if (!ins->visible) {
+			continue;
 		}
+		InstanceGeometryData *geom = (InstanceGeometryData *)ins->base_data;
 
-		scene_render->voxel_gi_update(probe->probe_instance, update_lights, probe->light_instances, scratch_frame->cull_result.geometry_instances);
+		if (ins->scenario && ins->array_index >= 0 && (ins->scenario->instance_data[ins->array_index].flags & InstanceData::FLAG_GEOM_VOXEL_GI_DIRTY)) {
+			uint32_t idx = 0;
+			for (const Instance *F : geom->voxel_gi_instances) {
+				InstanceVoxelGIData *voxel_gi2 = static_cast<InstanceVoxelGIData *>(F->base_data);
 
-		voxel_gi_update_list.remove(voxel_gi);
+				instance_pair_buffer[idx++] = voxel_gi2->probe_instance;
+				if (idx == MAX_INSTANCE_PAIRS) {
+					break;
+				}
+			}
 
-		voxel_gi = next;
+			ERR_FAIL_NULL_V(geom->geometry_instance, update_lights);
+			geom->geometry_instance->pair_voxel_gi_instances(instance_pair_buffer, idx);
+
+			ins->scenario->instance_data[ins->array_index].flags &= ~InstanceData::FLAG_GEOM_VOXEL_GI_DIRTY;
+		}
+	}
+	return update_lights;
+}
+
+// The renderer's half: the dynamic geometry in view, as a list. Reads only.
+void RendererSceneCull::_voxel_gi_collect_dynamic(InstanceVoxelGIData *probe, PagedArray<RenderGeometryInstance *> &r_geometry) const {
+	for (Instance *ins : probe->dynamic_geometries) {
+		if (!ins->visible) {
+			continue;
+		}
+		InstanceGeometryData *geom = (InstanceGeometryData *)ins->base_data;
+		ERR_CONTINUE(!geom->geometry_instance);
+		r_geometry.push_back(geom->geometry_instance);
 	}
 }
 
@@ -4733,6 +4772,343 @@ TypedArray<Image> RendererSceneCull::bake_render_uv2(RID p_base, const TypedArra
 PackedByteArray RendererSceneCull::bake_render_area_light_atlas(const TypedArray<RID> &p_area_light_textures, const TypedArray<Rect2> &p_area_light_atlas_texture_rects, const Size2i &p_size, int p_mipmaps) {
 	return scene_render->bake_render_area_light_atlas(p_area_light_textures, p_area_light_atlas_texture_rects, p_size, p_mipmaps);
 }
+
+#ifdef MACRAME_ENABLED
+void RendererSceneCull::macrame_check_boundary() {
+	macrame_cull_requests.check_boundary("cull requests (probe redraws, voxel GI updates)");
+	macrame_job_results.check_boundary("job results (probes, voxel GI, heightfields)");
+}
+
+// The scene update, at its head: what the cull saw and the record finished, applied by the owner
+// of the lists and flags they name; then what this run's cull will need of the scene.
+void RendererSceneCull::macrame_update_head() {
+	macrame_cull_requests.drain([this](const MacrameCullRequest &q) {
+		Instance *instance = instance_owner.get_or_null(q.instance);
+		if (!instance || !instance->scenario || !instance->base_data) {
+			return;
+		}
+		if (q.kind == MacrameCullRequest::PROBE_REDRAW) {
+			if (instance->base_type != RSE::INSTANCE_REFLECTION_PROBE) {
+				return;
+			}
+			InstanceReflectionProbeData *reflection_probe = static_cast<InstanceReflectionProbeData *>(instance->base_data);
+			if (!reflection_probe->update_list.in_list()) {
+				reflection_probe->render_step = 0;
+				reflection_probe_render_list.add_last(&reflection_probe->update_list);
+			}
+			if (instance->array_index >= 0) {
+				instance->scenario->instance_data[instance->array_index].flags &= ~InstanceData::FLAG_REFLECTION_PROBE_DIRTY;
+			}
+		} else {
+			if (instance->base_type != RSE::INSTANCE_VOXEL_GI) {
+				return;
+			}
+			InstanceVoxelGIData *voxel_gi = static_cast<InstanceVoxelGIData *>(instance->base_data);
+			if (!voxel_gi->update_element.in_list()) {
+				voxel_gi_update_list.add(&voxel_gi->update_element);
+			}
+		}
+	});
+	macrame_job_results.drain([this](const MacrameJobResult &r) { _macrame_apply_job_result(r); });
+	// The atlas buffers of the probes listed (a CPU object the cull names; the record configures it).
+	for (SelfList<InstanceReflectionProbeData> *e = reflection_probe_render_list.first(); e; e = e->next()) {
+		Instance *instance = e->self()->owner;
+		if (instance && instance->scenario && instance->scenario->reflection_atlas.is_valid()) {
+			RSG::light_storage->reflection_probe_atlas_ensure_render_buffers(instance->scenario->reflection_atlas);
+		}
+	}
+	// The light caches and pairings of the voxel GIs listed: the scene's half of their update.
+	for (SelfList<InstanceVoxelGIData> *e = voxel_gi_update_list.first(); e; e = e->next()) {
+		InstanceVoxelGIData *probe = e->self();
+		probe->macrame_update_lights = _voxel_gi_prepare(probe);
+	}
+}
+
+void RendererSceneCull::_macrame_apply_job_result(const MacrameJobResult &r) {
+	Instance *instance = instance_owner.get_or_null(r.instance);
+	if (!instance || !instance->base_data) {
+		return;
+	}
+	switch (r.kind) {
+		case MacrameJobResult::PROBE: {
+			if (instance->base_type != RSE::INSTANCE_REFLECTION_PROBE) {
+				return;
+			}
+			InstanceReflectionProbeData *reflection_probe = static_cast<InstanceReflectionProbeData *>(instance->base_data);
+			if (r.done) {
+				if (reflection_probe->update_list.in_list()) {
+					reflection_probe_render_list.remove(&reflection_probe->update_list);
+				}
+			} else {
+				reflection_probe->render_step++;
+			}
+		} break;
+		case MacrameJobResult::VOXEL_GI: {
+			if (instance->base_type != RSE::INSTANCE_VOXEL_GI) {
+				return;
+			}
+			InstanceVoxelGIData *voxel_gi = static_cast<InstanceVoxelGIData *>(instance->base_data);
+			if (voxel_gi->update_element.in_list()) {
+				voxel_gi_update_list.remove(&voxel_gi->update_element);
+			}
+		} break;
+		case MacrameJobResult::HEIGHTFIELD: {
+			heightfield_particle_colliders_update_list.erase(instance);
+		} break;
+	}
+}
+
+void RendererSceneCull::_macrame_job_done(const MacrameJobResult &r) {
+	if (MacrameRunParity::on_record_node()) {
+		macrame_job_results.add(r);
+	} else {
+		_macrame_apply_job_result(r); // One body holds every grant: the lists are its.
+	}
+}
+
+bool RendererSceneCull::_macrame_cull_probe_faces(Instance *p_instance, const Ref<RenderSceneBuffers> &p_render_buffers, MacrameRenderLists &r_lists, uint32_t &r_used, MacrameRenderLists::ProbeJob &r_job) {
+	InstanceReflectionProbeData *reflection_probe = static_cast<InstanceReflectionProbeData *>(p_instance->base_data);
+	Scenario *scenario = p_instance->scenario;
+	static const Vector3 view_normals[6] = {
+		Vector3(+1, 0, 0),
+		Vector3(-1, 0, 0),
+		Vector3(0, +1, 0),
+		Vector3(0, -1, 0),
+		Vector3(0, 0, +1),
+		Vector3(0, 0, -1)
+	};
+	static const Vector3 view_up[6] = {
+		Vector3(0, -1, 0),
+		Vector3(0, -1, 0),
+		Vector3(0, 0, +1),
+		Vector3(0, 0, -1),
+		Vector3(0, -1, 0),
+		Vector3(0, -1, 0)
+	};
+	Vector3 probe_size = RSG::light_storage->reflection_probe_get_size(p_instance->base);
+	Vector3 origin_offset = RSG::light_storage->reflection_probe_get_origin_offset(p_instance->base);
+	float max_distance = RSG::light_storage->reflection_probe_get_origin_max_distance(p_instance->base);
+	float atlas_size = RSG::light_storage->reflection_atlas_get_size(scenario->reflection_atlas);
+	float mesh_lod_threshold = RSG::light_storage->reflection_probe_get_mesh_lod_threshold(p_instance->base) / atlas_size;
+	bool use_shadows = RSG::light_storage->reflection_probe_renders_shadows(p_instance->base);
+	RID shadow_atlas = use_shadows ? scenario->reflection_probe_shadow_atlas : RID();
+	RID environment = scenario->environment.is_valid() ? scenario->environment : scenario->fallback_environment;
+	for (uint32_t face = 0; face < 6; face++) {
+		Vector3 edge = view_normals[face] * probe_size / 2;
+		float distance = Math::abs(view_normals[face].dot(edge) - view_normals[face].dot(origin_offset));
+		max_distance = MAX(max_distance, distance);
+
+		Projection cm;
+		cm.set_perspective(90, 1, 0.01, max_distance);
+
+		Transform3D local_view;
+		local_view.set_look_at(origin_offset, origin_offset + view_normals[face], view_up[face]);
+
+		RendererSceneRender::CameraData camera_data;
+		Transform3D xform = p_instance->transform * local_view;
+		camera_data.set_camera(xform, cm, false, false);
+
+		RenderSceneCullFrame *frame = r_lists.acquire(this, r_used);
+		if (!frame) {
+			return false;
+		}
+		r_used++;
+		_cull_scene(*frame, &camera_data, p_render_buffers, environment, RID(), RID(), RSG::light_storage->reflection_probe_get_cull_mask(p_instance->base), scenario->self, RID(), shadow_atlas, reflection_probe->instance, face, mesh_lod_threshold, 1.0, use_shadows, nullptr);
+		cull_frame_set_number(frame, r_lists.frame_number);
+		r_job.faces[face] = frame;
+	}
+	return true;
+}
+
+// The cull node, after the viewports: what the frustum culls saw for the scene update, then the
+// device work of the scene culled into frames for the record node. Reads the scene; writes the
+// lists, its own memo, and the mailbox.
+void RendererSceneCull::macrame_cull_jobs(MacrameRenderLists &r_lists) {
+	for (const MacrameRenderLists::Entry &e : r_lists.entries) {
+		InstanceCullResult &cr = e.frame->cull_result;
+		for (const RID &rid : cr.probe_redraws) {
+			macrame_cull_requests.add({ MacrameCullRequest::PROBE_REDRAW, rid });
+		}
+		for (const RID &rid : cr.voxel_gi_updates) {
+			macrame_cull_requests.add({ MacrameCullRequest::VOXEL_GI_UPDATE, rid });
+		}
+		cr.probe_redraws.clear();
+		cr.voxel_gi_updates.clear();
+	}
+	uint32_t used = r_lists.frames_used;
+	const uint64_t run = MacrameRunParity::current();
+
+	// Reflection probes: one UPDATE_ONCE probe per frame, every UPDATE_ALWAYS one (as render_probes).
+	bool busy = false;
+	for (SelfList<InstanceReflectionProbeData> *e = reflection_probe_render_list.first(); e; e = e->next()) {
+		InstanceReflectionProbeData *reflection_probe = e->self();
+		Instance *instance = reflection_probe->owner;
+		if (!instance || !instance->scenario) {
+			continue;
+		}
+		const RSE::ReflectionProbeUpdateMode mode = RSG::light_storage->reflection_probe_get_update_mode(instance->base);
+		if (mode == RSE::REFLECTION_PROBE_UPDATE_ONCE && busy) {
+			continue;
+		}
+		const MacrameProbeIssue *issued = macrame_probe_issued.getptr(instance->self);
+		if (issued && issued->step == reflection_probe->render_step && run - issued->run < 3) {
+			continue; // Issued; the scene update advances it within two runs.
+		}
+		MacrameRenderLists::ProbeJob job;
+		job.instance = instance->self;
+		job.probe_instance = reflection_probe->instance;
+		job.atlas = instance->scenario->reflection_atlas;
+		job.always = mode == RSE::REFLECTION_PROBE_UPDATE_ALWAYS;
+		job.step = job.always ? 0 : reflection_probe->render_step;
+		if (job.step == 0) {
+			Ref<RenderSceneBuffers> render_buffers = RSG::light_storage->reflection_probe_atlas_get_render_buffers(job.atlas);
+			if (render_buffers.is_null()) {
+				continue; // The scene update makes them at its next head.
+			}
+			if (!_macrame_cull_probe_faces(instance, render_buffers, r_lists, used, job)) {
+				continue;
+			}
+		}
+		if (mode == RSE::REFLECTION_PROBE_UPDATE_ONCE) {
+			busy = true;
+		}
+		macrame_probe_issued[instance->self] = { reflection_probe->render_step, run };
+		r_lists.probe_jobs.push_back(job);
+	}
+
+	// Voxel GIs listed: the dynamic geometry in view (the light caches were the scene update's).
+	for (SelfList<InstanceVoxelGIData> *e = voxel_gi_update_list.first(); e; e = e->next()) {
+		InstanceVoxelGIData *probe = e->self();
+		if (!probe->owner) {
+			continue;
+		}
+		RenderSceneCullFrame *frame = r_lists.acquire(this, used);
+		if (!frame) {
+			break;
+		}
+		used++;
+		frame->cull_result.geometry_instances.clear();
+		_voxel_gi_collect_dynamic(probe, frame->cull_result.geometry_instances);
+		MacrameRenderLists::VoxelGIJob job;
+		job.instance = probe->owner->self;
+		job.probe_instance = probe->probe_instance;
+		job.update_lights = probe->macrame_update_lights;
+		job.light_instances = probe->light_instances;
+		job.geometry = frame;
+		r_lists.voxel_gi_jobs.push_back(job);
+	}
+
+	// Particle collider heightfields: the geometry under each, from the indexers.
+	for (Instance *hfpc : heightfield_particle_colliders_update_list) {
+		MacrameRenderLists::HeightfieldJob job;
+		job.instance = hfpc->self;
+		if (hfpc->scenario && hfpc->base_type == RSE::INSTANCE_PARTICLES_COLLISION && RSG::particles_storage->particles_collision_is_heightfield(hfpc->base)) {
+			RenderSceneCullFrame *frame = r_lists.acquire(this, used);
+			if (!frame) {
+				break;
+			}
+			used++;
+			frame->shadow_cull_scratch.clear();
+			frame->cull_result.geometry_instances.clear();
+
+			struct CullAABB {
+				PagedArray<Instance *> *result;
+				uint32_t heightfield_mask;
+				_FORCE_INLINE_ bool operator()(void *p_data) {
+					Instance *p_instance = (Instance *)p_data;
+					if (p_instance->layer_mask & heightfield_mask) {
+						result->push_back(p_instance);
+					}
+					return false;
+				}
+			};
+
+			CullAABB cull_aabb;
+			cull_aabb.result = &frame->shadow_cull_scratch;
+			cull_aabb.heightfield_mask = RSG::particles_storage->particles_collision_get_height_field_mask(hfpc->base);
+			hfpc->scenario->indexers[Scenario::INDEXER_GEOMETRY].aabb_query(hfpc->transformed_aabb, cull_aabb);
+			hfpc->scenario->indexers[Scenario::INDEXER_VOLUMES].aabb_query(hfpc->transformed_aabb, cull_aabb);
+
+			for (int i = 0; i < (int)frame->shadow_cull_scratch.size(); i++) {
+				Instance *instance = frame->shadow_cull_scratch[i];
+				if (!instance || !((1 << instance->base_type) & (RSE::INSTANCE_GEOMETRY_MASK & (~(1 << RSE::INSTANCE_PARTICLES))))) { //all but particles to avoid self collision
+					continue;
+				}
+				InstanceGeometryData *geom = static_cast<InstanceGeometryData *>(instance->base_data);
+				ERR_CONTINUE(!geom->geometry_instance);
+				frame->cull_result.geometry_instances.push_back(geom->geometry_instance);
+			}
+			frame->shadow_cull_scratch.clear();
+			job.base = hfpc->base;
+			job.transform = hfpc->transform;
+			job.geometry = frame;
+		}
+		r_lists.heightfield_jobs.push_back(job); // No geometry: nothing to render, dropped from the list.
+	}
+	r_lists.frames_used = used;
+}
+
+// The record node: the device work of the jobs, from the frames the cull prepared; what became
+// of each goes back to the scene update.
+void RendererSceneCull::_macrame_draw_jobs(const MacrameRenderLists &p_lists) {
+	if (p_lists.probe_jobs.size()) {
+		RENDER_TIMESTAMP("Render ReflectionProbes");
+	}
+	for (const MacrameRenderLists::ProbeJob &job : p_lists.probe_jobs) {
+		MacrameJobResult r;
+		r.kind = MacrameJobResult::PROBE;
+		r.instance = job.instance;
+		if (job.step == 0) {
+			if (!RSG::light_storage->reflection_probe_instance_begin_render(job.probe_instance, job.atlas)) {
+				r.done = true; // All full, no atlas entry to render to.
+			} else {
+				for (int face = 0; face < 6; face++) {
+					if (job.faces[face]) {
+						RENDER_TIMESTAMP("Render ReflectionProbe, Face " + itos(face));
+						_draw_culled_scene(*job.faces[face]);
+					}
+				}
+				RSG::light_storage->reflection_probe_instance_end_render(job.probe_instance, job.atlas);
+				if (job.always) {
+					int step = 1;
+					bool done = false;
+					while (!done) {
+						RENDER_TIMESTAMP("Post-Process ReflectionProbe, Step " + itos(step));
+						done = RSG::light_storage->reflection_probe_instance_postprocess_step(job.probe_instance);
+						step++;
+					}
+					r.done = true;
+				}
+			}
+		} else {
+			RENDER_TIMESTAMP("Post-Process ReflectionProbe, Step " + itos(job.step));
+			r.done = !RSG::light_storage->reflection_probe_has_atlas_index(job.probe_instance) || RSG::light_storage->reflection_probe_instance_postprocess_step(job.probe_instance);
+		}
+		_macrame_job_done(r);
+	}
+	if (p_lists.voxel_gi_jobs.size()) {
+		RENDER_TIMESTAMP("Render VoxelGI");
+	}
+	for (const MacrameRenderLists::VoxelGIJob &job : p_lists.voxel_gi_jobs) {
+		scene_render->voxel_gi_update(job.probe_instance, job.update_lights, job.light_instances, job.geometry->cull_result.geometry_instances);
+		MacrameJobResult r;
+		r.kind = MacrameJobResult::VOXEL_GI;
+		r.instance = job.instance;
+		r.done = true;
+		_macrame_job_done(r);
+	}
+	for (const MacrameRenderLists::HeightfieldJob &job : p_lists.heightfield_jobs) {
+		if (job.geometry) {
+			scene_render->render_particle_collider_heightfield(job.base, job.transform, job.geometry->cull_result.geometry_instances);
+		}
+		MacrameJobResult r;
+		r.kind = MacrameJobResult::HEIGHTFIELD;
+		r.instance = job.instance;
+		r.done = true;
+		_macrame_job_done(r);
+	}
+}
+#endif
 
 void RendererSceneCull::update_visibility_notifiers() {
 	SelfList<InstanceVisibilityNotifierData> *E = visible_notifier_list.first();

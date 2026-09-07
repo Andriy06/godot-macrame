@@ -163,6 +163,7 @@ public:
 	virtual bool reflection_probe_instance_begin_render(RID p_instance, RID p_reflection_atlas) = 0;
 	virtual bool reflection_probe_instance_end_render(RID p_instance, RID p_reflection_atlas) = 0;
 	virtual Ref<RenderSceneBuffers> reflection_probe_atlas_get_render_buffers(RID p_reflection_atlas) = 0;
+	virtual void reflection_probe_atlas_ensure_render_buffers(RID p_reflection_atlas) {} // Macrame: the scene update makes them before a probe is culled.
 	virtual bool reflection_probe_instance_postprocess_step(RID p_instance) = 0;
 
 	/* LIGHTMAP  */
@@ -211,5 +212,8 @@ public:
 
 	virtual void directional_shadow_atlas_set_size(int p_size, bool p_16_bits = true) = 0;
 	virtual int get_directional_light_shadow_size(RID p_light_instance) = 0;
+	// Macrame: the cull node's frame carries its own directional shadow count; the storage's is the
+	// record node's (set per frame it draws), so the cull must not read it beside the record.
+	virtual int get_directional_light_shadow_size(RID p_light_instance, int p_light_count) { return get_directional_light_shadow_size(p_light_instance); }
 	virtual void set_directional_shadow_count(int p_count) = 0;
 };

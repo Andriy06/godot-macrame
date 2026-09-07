@@ -47,6 +47,11 @@
 #include "servers/rendering/rendering_server_types.h"
 #include "servers/rendering/storage/utilities.h"
 
+#ifdef MACRAME_ENABLED
+#include "core/macrame/macrame_render_lists.h"
+#include "core/macrame/macrame_run_parity.h"
+#endif
+
 class RenderingLightCuller;
 
 class RendererSceneCull : public RenderingMethod {
@@ -790,6 +795,9 @@ public:
 
 		bool invalid;
 		uint32_t base_version;
+#ifdef MACRAME_ENABLED
+		bool macrame_update_lights = false; // Decided by the scene update (`_voxel_gi_prepare`), read by the cull into the job.
+#endif
 
 		SelfList<InstanceVoxelGIData> update_element;
 
@@ -896,8 +904,17 @@ public:
 
 		PagedArray<RenderGeometryInstance *> sdfgi_region_geometry_instances[SDFGI_MAX_CASCADES * SDFGI_MAX_REGIONS_PER_CASCADE];
 		PagedArray<RID> sdfgi_cascade_lights[SDFGI_MAX_CASCADES];
+#ifdef MACRAME_ENABLED
+		// What the cull saw that the scene update has to list (the cull node writes no scene list).
+		LocalVector<RID> probe_redraws;
+		LocalVector<RID> voxel_gi_updates;
+#endif
 
 		void clear() {
+#ifdef MACRAME_ENABLED
+			probe_redraws.clear();
+			voxel_gi_updates.clear();
+#endif
 			geometry_instances.clear();
 			lights.clear();
 			light_instances.clear();
@@ -924,6 +941,10 @@ public:
 		}
 
 		void reset() {
+#ifdef MACRAME_ENABLED
+			probe_redraws.clear();
+			voxel_gi_updates.clear();
+#endif
 			geometry_instances.reset();
 			lights.reset();
 			light_instances.reset();
@@ -950,6 +971,14 @@ public:
 		}
 
 		void append_from(InstanceCullResult &p_cull_result) {
+#ifdef MACRAME_ENABLED
+			for (const RID &rid : p_cull_result.probe_redraws) {
+				probe_redraws.push_back(rid);
+			}
+			for (const RID &rid : p_cull_result.voxel_gi_updates) {
+				voxel_gi_updates.push_back(rid);
+			}
+#endif
 			geometry_instances.merge_unordered(p_cull_result.geometry_instances);
 			lights.merge_unordered(p_cull_result.lights);
 			light_instances.merge_unordered(p_cull_result.light_instances);
@@ -1196,6 +1225,45 @@ public:
 	};
 	mutable LocalVector<DeferredInstanceUpdate> deferred_instance_updates[2];
 	int deferred_write = 0;
+#ifdef MACRAME_ENABLED
+	// The three-node pipeline's hand-offs for the scene's own device work (results 2.18): what the
+	// cull node saw that the scene has to list (a probe to redraw, a voxel GI in view), and what
+	// the record node finished (a probe step, a voxel GI update, a collider heightfield). The
+	// scene update applies both at its head; the lists and flags they touch are its.
+	struct MacrameCullRequest {
+		enum Kind { PROBE_REDRAW, VOXEL_GI_UPDATE };
+		Kind kind = PROBE_REDRAW;
+		RID instance;
+	};
+	struct MacrameJobResult {
+		enum Kind { PROBE, VOXEL_GI, HEIGHTFIELD };
+		Kind kind = PROBE;
+		RID instance;
+		bool done = false;
+	};
+	MacrameParityMailbox<MacrameCullRequest> macrame_cull_requests;
+	MacrameParityMailbox<MacrameJobResult> macrame_job_results;
+	// The cull node's own memo: the step it issued for a probe and when, so a probe is not
+	// issued again before the scene update advanced it (two runs at most).
+	struct MacrameProbeIssue {
+		int step = -1;
+		uint64_t run = 0;
+	};
+	HashMap<RID, MacrameProbeIssue> macrame_probe_issued;
+	const MacrameRenderLists *macrame_record_lists = nullptr;
+	virtual void macrame_update_head() override;
+	virtual void macrame_cull_jobs(MacrameRenderLists &r_lists) override;
+	virtual void macrame_set_record_lists(const MacrameRenderLists *p_lists) override { macrame_record_lists = p_lists; }
+	virtual void macrame_check_boundary() override;
+	void _macrame_draw_jobs(const MacrameRenderLists &p_lists);
+	void _macrame_job_done(const MacrameJobResult &p_result);
+	void _macrame_apply_job_result(const MacrameJobResult &p_result);
+	bool _macrame_cull_probe_faces(Instance *p_instance, const Ref<RenderSceneBuffers> &p_render_buffers, MacrameRenderLists &r_lists, uint32_t &r_used, MacrameRenderLists::ProbeJob &r_job);
+#endif
+	// The voxel GI update in two halves: the scene's (light cache, pairing of the dynamic geometry
+	// in view; returns whether the lights changed) and the list of that geometry for the renderer.
+	bool _voxel_gi_prepare(InstanceVoxelGIData *probe);
+	void _voxel_gi_collect_dynamic(InstanceVoxelGIData *probe, PagedArray<RenderGeometryInstance *> &r_geometry) const;
 	void update_dirty_instances() const;
 
 	void render_particle_colliders();

@@ -45,6 +45,7 @@ class XRInterface;
 class Image;
 class RenderSceneBuffers;
 struct RenderSceneCullFrame; // Macrame: a scene renderer's per-frame cull output (renderer_scene_cull.h).
+struct MacrameRenderLists;
 
 class RenderingMethod {
 public:
@@ -383,6 +384,16 @@ public:
 	virtual void macrame_run_boundary() {}
 	virtual bool macrame_device_update_deferred() const { return false; }
 	virtual void macrame_device_update() {}
+	// The head of the scene update: what the cull node saw and the record node finished last run
+	// (probe redraws, advances, voxel GI updates, collider heightfields), applied by their owner.
+	virtual void macrame_update_head() {}
+	// The cull node, after the viewports: the probe faces, voxel GI geometry and heightfield
+	// geometry the record node will draw, into frames of the lists.
+	virtual void macrame_cull_jobs(MacrameRenderLists &r_lists) {}
+	// The record node's view of the lists (null outside it); `render_probes` draws the jobs
+	// instead of culling itself when set.
+	virtual void macrame_set_record_lists(const MacrameRenderLists *p_lists) {}
+	virtual void macrame_check_boundary() {}
 
 	virtual void update() = 0;
 	virtual void render_probes() = 0;

@@ -38,8 +38,10 @@
 #include "servers/rendering/storage/render_scene_buffers.h"
 
 #ifdef MACRAME_ENABLED
+#include "core/macrame/macrame_run_parity.h"
 struct MacrameRenderLists;
 #endif
+struct MacrameViewportSnapshot; // Macrame: a viewport as the cull node saw it (below); null everywhere else.
 
 class RendererViewport {
 public:
@@ -191,6 +193,9 @@ public:
 	};
 
 	HashMap<String, RID> timestamp_vp_map;
+#ifdef MACRAME_ENABLED
+	friend struct MacrameViewportSnapshot;
+#endif
 
 	uint64_t draw_viewports_pass = 0;
 
@@ -212,13 +217,18 @@ private:
 	bool _viewport_requires_motion_vectors(Viewport *p_viewport);
 	void _viewport_set_force_motion_vectors(Viewport *p_viewport, bool p_force_motion_vectors);
 	void _configure_3d_render_buffers(Viewport *p_viewport);
-	void _draw_3d(Viewport *p_viewport);
-	void _draw_viewport(Viewport *p_viewport);
+	// `p_snapshot` set: the record node of the three-node pipeline, drawing the cull's copy of the
+	// viewport; the decisions that read the scene were taken by the cull and travel with it.
+	void _draw_3d(Viewport *p_viewport, const MacrameViewportSnapshot *p_snapshot = nullptr);
+	void _draw_viewport(Viewport *p_viewport, const MacrameViewportSnapshot *p_snapshot = nullptr);
 #ifdef MACRAME_ENABLED
 	// The record node's view of what the cull node prepared; null outside the record node (the
 	// non-split draw), in which case `_draw_3d` culls and draws in one go.
 	const MacrameRenderLists *record_lists = nullptr;
 	uint32_t macrame_cull_fallbacks = 0; // 3D viewports drawn through the combined path.
+	void _macrame_draw_viewports_from_lists(bool p_swap_buffers);
+	void _macrame_free_viewport_now(Viewport *p_viewport, RID p_rid);
+	void _macrame_size_occlusion_buffer(Viewport *p_viewport);
 #endif
 	DisplayServerEnums::WindowID _get_containing_window(Viewport *p_viewport);
 
@@ -330,6 +340,36 @@ public:
 	// `draw_viewports`, which then culls them itself.
 	void macrame_cull_viewports(MacrameRenderLists &r_lists);
 	void macrame_set_record_lists(const MacrameRenderLists *p_lists) { record_lists = p_lists; }
+
+	// Ownership of a viewport across the three nodes (results 2.18). The scene update owns the
+	// `Viewport` structs, the active list and its order, and creates the 3D buffers a viewport
+	// wants (`macrame_update_head`). The cull node reads them and copies each visible one into
+	// the lists (`macrame_cull_viewports`), with the decisions that read the scene. The record
+	// node draws the copies and keeps its own per-viewport state (timestamps, counters, the SDF
+	// flag); what the viewport must learn from a draw (a ONCE update done, a next-frame clear
+	// spent, the window's output range, the measured times) goes back by mailbox and the scene
+	// update applies it at its next head. A freed viewport is dropped from the active list at
+	// once and destroyed two runs later, when no copy names it.
+	struct MacrameRecordState {
+		uint64_t time_cpu_begin = 0, time_cpu_end = 0, time_gpu_begin = 0, time_gpu_end = 0;
+		bool sdf_active = false;
+	};
+	HashMap<RID, MacrameRecordState> macrame_record_state;
+	struct MacrameViewportResult {
+		RID viewport;
+		bool update_once_done = false;
+		bool clear_next_frame_spent = false;
+		float window_output_max_value = 1.0f;
+		RenderingServerTypes::RenderInfo render_info;
+		uint64_t time_cpu_begin = 0, time_cpu_end = 0, time_gpu_begin = 0, time_gpu_end = 0;
+	};
+	MacrameParityMailbox<MacrameViewportResult> macrame_viewport_results;
+	MacrameRunFrees<RID> macrame_viewport_frees;
+	void macrame_update_head();
+	void macrame_apply_result(const MacrameViewportResult &p_result);
+	void macrame_check_boundary() { macrame_viewport_results.check_boundary("viewport results"); }
+	MacrameViewportSnapshot *macrame_snapshot_acquire(MacrameRenderLists &r_lists, uint32_t p_index);
+	void macrame_snapshots_release(MacrameRenderLists &r_lists);
 	uint32_t macrame_get_cull_fallbacks() const { return macrame_cull_fallbacks; }
 #endif
 
@@ -346,3 +386,18 @@ public:
 	RendererViewport();
 	virtual ~RendererViewport() {}
 };
+
+#ifdef MACRAME_ENABLED
+// A viewport as the cull node saw it, for the record node: the struct itself, copied, plus the
+// decisions `_draw_viewport` takes by reading the scene (the record node reads no scene).
+struct MacrameViewportSnapshot {
+	RendererViewport::Viewport view;
+	DisplayServerEnums::WindowID window = DisplayServerEnums::INVALID_WINDOW_ID;
+	bool environment_disabled = false;
+	bool scenario_draw_canvas_bg = false;
+	int scenario_canvas_max_layer = 0;
+	bool force_clear_render_target = false;
+	bool can_draw_3d = false;
+	bool is_scenario = false;
+};
+#endif

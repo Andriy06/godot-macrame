@@ -1848,6 +1848,13 @@ Ref<RenderSceneBuffers> LightStorage::reflection_probe_atlas_get_render_buffers(
 	return atlas->render_buffers;
 }
 
+void LightStorage::reflection_probe_atlas_ensure_render_buffers(RID p_reflection_atlas) {
+	ReflectionAtlas *atlas = reflection_atlas_owner.get_or_null(p_reflection_atlas);
+	if (atlas && atlas->render_buffers.is_null()) {
+		atlas->render_buffers.instantiate(); // What `reflection_probe_instance_begin_render` does first; the configuration is still its.
+	}
+}
+
 bool LightStorage::reflection_probe_instance_postprocess_step(RID p_instance) {
 	ReflectionProbeInstance *rpi = reflection_probe_instance_owner.get_or_null(p_instance);
 	ERR_FAIL_NULL_V(rpi, false);
@@ -2825,9 +2832,13 @@ Rect2i LightStorage::get_directional_shadow_rect() {
 }
 
 int LightStorage::get_directional_light_shadow_size(RID p_light_instance) {
-	ERR_FAIL_COND_V(directional_shadow.light_count == 0, 0);
+	return get_directional_light_shadow_size(p_light_instance, directional_shadow.light_count);
+}
 
-	Rect2i r = _get_directional_shadow_rect(directional_shadow.size, directional_shadow.light_count, 0);
+int LightStorage::get_directional_light_shadow_size(RID p_light_instance, int p_light_count) {
+	ERR_FAIL_COND_V(p_light_count == 0, 0);
+
+	Rect2i r = _get_directional_shadow_rect(directional_shadow.size, p_light_count, 0);
 
 	LightInstance *light_instance = light_instance_owner.get_or_null(p_light_instance);
 	ERR_FAIL_NULL_V(light_instance, 0);

@@ -30,10 +30,13 @@
 
 #pragma once
 
+#include "core/math/transform_3d.h"
 #include "core/templates/local_vector.h"
 #include "core/templates/rid.h"
+#include "core/templates/vector.h"
 
 struct RenderSceneCullFrame;
+struct MacrameViewportSnapshot; // renderer_viewport.h: a viewport as the cull saw it, for the record node.
 class RenderingMethod;
 
 // The value the cull node produces and the record node consumes: one culled frame per 3D
@@ -51,6 +54,48 @@ struct MacrameRenderLists {
 	};
 	LocalVector<Entry> entries; // The frames culled this run.
 	LocalVector<RenderSceneCullFrame *> pool; // Every frame this value owns; `entries` point into it.
+	uint32_t frames_used = 0; // How many of `pool` this run's cull took.
+
+	// Every viewport the record node draws this run, in draw order, each with the copy of the
+	// viewport the cull node took after the scene update (the record node reads the copy, never
+	// the viewport: the next scene update is rewriting that beside it). The 3D ones also have a
+	// frame in `entries`.
+	struct ViewportEntry {
+		RID viewport;
+		MacrameViewportSnapshot *snapshot = nullptr;
+		RenderSceneCullFrame *frame = nullptr;
+	};
+	LocalVector<ViewportEntry> viewports;
+	LocalVector<MacrameViewportSnapshot *> snapshot_pool; // Owned like `pool`; managed by the viewport server.
+
+	// The device work the record node does for the scene besides the viewports, each culled by
+	// the cull node into frames of this value: a reflection probe's six faces (or one
+	// post-process step), a voxel GI's dynamic geometry, a particle collider's heightfield. What
+	// the record node did with them travels back to the scene update by mailbox.
+	struct ProbeJob {
+		RID instance; // The probe's scene instance.
+		RID probe_instance; // The light storage's probe instance.
+		RID atlas;
+		int step = 0; // 0: render the faces (culled below); >0: a post-process step.
+		bool always = false; // UPDATE_ALWAYS: the record runs every step at once.
+		RenderSceneCullFrame *faces[6] = {};
+	};
+	struct VoxelGIJob {
+		RID instance;
+		RID probe_instance;
+		bool update_lights = false;
+		Vector<RID> light_instances;
+		RenderSceneCullFrame *geometry = nullptr; // `cull_result.geometry_instances`: the dynamic geometry in view.
+	};
+	struct HeightfieldJob {
+		RID instance;
+		RID base;
+		Transform3D transform;
+		RenderSceneCullFrame *geometry = nullptr;
+	};
+	LocalVector<ProbeJob> probe_jobs;
+	LocalVector<VoxelGIJob> voxel_gi_jobs;
+	LocalVector<HeightfieldJob> heightfield_jobs;
 	void *run_data = nullptr; // The renderer's update -> record hand-off of the run (opaque).
 	bool owns_run_data = false; // A cull set owns its run data; a published copy only names it.
 	uint64_t frame_number = 0;
@@ -65,6 +110,11 @@ struct MacrameRenderLists {
 	MacrameRenderLists published_copy() const {
 		MacrameRenderLists c;
 		c.entries = entries;
+		c.viewports = viewports;
+		c.probe_jobs = probe_jobs;
+		c.voxel_gi_jobs = voxel_gi_jobs;
+		c.heightfield_jobs = heightfield_jobs;
+		c.frames_used = frames_used;
 		c.run_data = run_data;
 		c.owns_run_data = false;
 		c.frame_number = frame_number;
@@ -87,6 +137,13 @@ struct MacrameRenderLists {
 
 	// The next pooled frame, creating one through `p_scene` if the pool is short.
 	RenderSceneCullFrame *acquire(RenderingMethod *p_scene, uint32_t p_index);
-	// Free every pooled frame through `p_scene`; call before the scene renderer goes away.
+	// Free every pooled frame through `p_scene`; call before the scene renderer goes away. The
+	// snapshots are the viewport server's to free (`RendererViewport::macrame_snapshots_release`).
 	void release(RenderingMethod *p_scene);
+	void clear_jobs() {
+		viewports.clear();
+		probe_jobs.clear();
+		voxel_gi_jobs.clear();
+		heightfield_jobs.clear();
+	}
 };

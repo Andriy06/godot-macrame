@@ -33,6 +33,7 @@
 #include "core/profiling/profiling.h"
 #include "core/macrame/macrame_phase_probe.h"
 #include "core/macrame/macrame_render_grant.h"
+#include "core/macrame/macrame_run_parity.h"
 #include "ts/parallel_for.h"
 #include "ts/scheduler.h"
 
@@ -5225,6 +5226,14 @@ void RenderForwardClustered::_mesh_generate_all_pipelines_for_surface_cache(Geom
 }
 
 void RenderForwardClustered::_update_dirty_geometry_instances() {
+#ifdef MACRAME_ENABLED
+	if (MacrameRunParity::on_record_node()) {
+		// The record node of the three-node pipeline (a collider heightfield job): the scene update
+		// of this run rebuilt the geometry and handed the surfaces over; only the pipelines are its.
+		_update_dirty_geometry_pipelines();
+		return;
+	}
+#endif
 	update_geometry_instances();
 	// Outside the frame pipeline (material and uv2 baking, SDFGI, colliders) the same body holds
 	// both halves: register and free at once.

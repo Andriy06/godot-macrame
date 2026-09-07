@@ -45,6 +45,7 @@ RenderSceneCullFrame *MacrameRenderLists::acquire(RenderingMethod *p_scene, uint
 
 void MacrameRenderLists::release(RenderingMethod *p_scene) {
 	entries.clear();
+	clear_jobs();
 	for (RenderSceneCullFrame *f : pool) {
 		p_scene->cull_frame_free(f);
 	}

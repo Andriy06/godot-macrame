@@ -125,6 +125,7 @@ void RenderingServerDefault::_macrame_update_node() {
 	if (!render_request) {
 		return; // Start-up only; see `_macrame_render_node`.
 	}
+	GodotProfileZone("Macrame: scene update node");
 	MacrameRender::set_holds_grant(true);
 	MacrameRuntime::long_task_begin();
 	MacramePhaseProbe::lane_begin(MacrameScene::frame_graph_kind(), "scene update node");
@@ -143,9 +144,11 @@ void RenderingServerDefault::_macrame_cull_node(MacrameRenderLists &p_lists) {
 	if (!render_request) {
 		return;
 	}
+	GodotProfileZone("Macrame: cull node");
 	MacrameRuntime::long_task_begin();
 	MacramePhaseProbe::lane_begin(MacrameScene::frame_graph_kind(), "cull node");
 	RSG::viewport->macrame_cull_viewports(p_lists);
+	RSG::scene->macrame_cull_jobs(p_lists);
 	if (!p_lists.run_data) {
 		p_lists.run_data = RSG::scene->macrame_run_data_create();
 		p_lists.owns_run_data = true;
@@ -169,13 +172,16 @@ void RenderingServerDefault::_macrame_record_node(const MacrameRenderLists &p_li
 	const int slot = split_draw ? render_slot : -1;
 	MacrameRecord::set_holds_grant(true);
 	MacrameRuntime::long_task_begin();
+	GodotProfileZone("Macrame: record node");
 	MacramePhaseProbe::lane_begin(MacrameScene::frame_graph_kind(), "record node");
 	if (p_lists.run_data) {
 		RSG::scene->macrame_apply_run_data(p_lists.run_data); // No recorded frame names what the update freed.
 	}
 	MACRAME_PHASE("record: run data (compile lists, deferred frees)");
 	RSG::viewport->macrame_set_record_lists(&p_lists);
+	RSG::scene->macrame_set_record_lists(&p_lists);
 	_draw_record(render_present, render_step, slot);
+	RSG::scene->macrame_set_record_lists(nullptr);
 	RSG::viewport->macrame_set_record_lists(nullptr);
 	MacramePhaseProbe::lane_end();
 	MacrameRuntime::long_task_end();
@@ -196,6 +202,7 @@ void RenderingServerDefault::_macrame_cull_node_lagged() {
 	CullSet &set = cull_sets[cull_set];
 	CRASH_COND_MSG(set.state != CullSet::FREE, "Macrame: the cull node's set is still owned by a recorded frame.");
 	set.state = CullSet::CULLING;
+	GodotProfileZone("Macrame: cull node");
 	MacrameRuntime::long_task_begin();
 	MacramePhaseProbe::lane_begin(MacrameScene::frame_graph_kind(), "cull node");
 	set.lists.frame_number = post_frame_number;
@@ -205,6 +212,7 @@ void RenderingServerDefault::_macrame_cull_node_lagged() {
 	set.lists.set_index = cull_set;
 	set.lists.valid = true;
 	RSG::viewport->macrame_cull_viewports(set.lists);
+	RSG::scene->macrame_cull_jobs(set.lists);
 	if (!set.lists.run_data) {
 		set.lists.run_data = RSG::scene->macrame_run_data_create();
 		set.lists.owns_run_data = true;
@@ -237,13 +245,16 @@ void RenderingServerDefault::_macrame_record_node_lagged(const MacrameRenderList
 	const int slot = p_front.render_slot;
 	MacrameRecord::set_holds_grant(true);
 	MacrameRuntime::long_task_begin();
+	GodotProfileZone("Macrame: record node");
 	MacramePhaseProbe::lane_begin(MacrameScene::frame_graph_kind(), "record node");
 	if (p_front.run_data) {
 		RSG::scene->macrame_apply_run_data(p_front.run_data);
 	}
 	MACRAME_PHASE("record: run data (compile lists, deferred frees)");
 	RSG::viewport->macrame_set_record_lists(&p_front);
+	RSG::scene->macrame_set_record_lists(&p_front);
 	_draw_record(p_front.present, p_front.step, slot);
+	RSG::scene->macrame_set_record_lists(nullptr);
 	RSG::viewport->macrame_set_record_lists(nullptr);
 	MacramePhaseProbe::lane_end();
 	MacrameRuntime::long_task_end();
@@ -262,6 +273,7 @@ void RenderingServerDefault::_macrame_submit_node() {
 	h.valid = false;
 	MacrameRenderDevice::set_holds_grant(true);
 	MacrameRuntime::long_task_begin();
+	GodotProfileZone("Macrame: submit node");
 	MacramePhaseProbe::lane_begin(MacrameScene::frame_graph_kind(), "submit node");
 	RSG::rasterizer->submit_staged(h.staged, h.present);
 	MACRAME_PHASE("submit: compile + queue submit + present");
@@ -342,6 +354,15 @@ void RenderingServerDefault::_draw_update(double frame_step) {
 	GodotProfileZoneGroupedFirst(_profile_zone, "rasterizer->begin_frame");
 	RSG::rasterizer->begin_frame(frame_step);
 	MACRAME_PHASE("begin_frame");
+#ifdef MACRAME_ENABLED
+	if (split_render_nodes) {
+		// The scene update's head (results 2.18): what the cull and record nodes handed back by
+		// mailbox, the viewport order, the buffers viewports want, the probes' atlas buffers.
+		RSG::viewport->macrame_update_head();
+		RSG::scene->macrame_update_head();
+		MACRAME_PHASE("su: mailboxes, viewport head");
+	}
+#endif
 
 
 	uint64_t time_usec = OS::get_singleton()->get_ticks_usec();
@@ -613,9 +634,13 @@ void RenderingServerDefault::_init() {
 
 void RenderingServerDefault::_finish() {
 #ifdef MACRAME_ENABLED
-	lists_guarded.access([](MacrameRenderLists &p_lists) { p_lists.release(RSG::scene); }).sync();
+	lists_guarded.access([](MacrameRenderLists &p_lists) {
+		RSG::viewport->macrame_snapshots_release(p_lists);
+		p_lists.release(RSG::scene);
+	}).sync();
 	lists_versioned.discard(); // A staged frame nobody will record.
 	for (int i = 0; i < CULL_SETS; i++) {
+		RSG::viewport->macrame_snapshots_release(cull_sets[i].lists);
 		cull_sets[i].lists.release(RSG::scene);
 	}
 	if (single_run_data) {
@@ -895,6 +920,8 @@ void RenderingServerDefault::draw(bool p_present, double frame_step) {
 		// the parity lists key on (nobody reads it while it moves: the run is joined).
 		RSG::utilities->macrame_run_boundary();
 		MacrameDeferredNotify::check_boundary();
+		RSG::viewport->macrame_check_boundary();
+		RSG::scene->macrame_check_boundary();
 		if (RenderingDevice::get_singleton()) {
 			RenderingDevice::get_singleton()->macrame_run_boundary();
 		}

@@ -945,6 +945,7 @@ public:
 	virtual bool reflection_probe_instance_begin_render(RID p_instance, RID p_reflection_atlas) override;
 	virtual bool reflection_probe_instance_end_render(RID p_instance, RID p_reflection_atlas) override;
 	virtual Ref<RenderSceneBuffers> reflection_probe_atlas_get_render_buffers(RID p_reflection_atlas) override;
+	virtual void reflection_probe_atlas_ensure_render_buffers(RID p_reflection_atlas) override;
 	virtual bool reflection_probe_instance_postprocess_step(RID p_instance) override;
 
 	uint32_t reflection_probe_instance_get_resolution(RID p_instance);
@@ -1171,6 +1172,7 @@ public:
 
 	virtual void directional_shadow_atlas_set_size(int p_size, bool p_16_bits = true) override;
 	virtual int get_directional_light_shadow_size(RID p_light_instance) override;
+	virtual int get_directional_light_shadow_size(RID p_light_instance, int p_light_count) override;
 	virtual void set_directional_shadow_count(int p_count) override;
 
 	Rect2i get_directional_shadow_rect();
