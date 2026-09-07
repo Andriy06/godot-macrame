@@ -163,7 +163,10 @@ static RD::HitShaderBindingTableRange _encode_hit_sbt_range(uint32_t p_offset, u
 // size threshold. This can be very beneficial towards reducing the time the main thread takes to record all the rendering commands. However,
 // this setting is not enabled by default as it's been shown to cause some strange issues with certain IHVs that have yet to be understood.
 
-#define SECONDARY_COMMAND_BUFFERS_PER_FRAME 0
+// One per draw recorder (results 2.20.7 step 1). Stock Godot ships 0 - the secondary path has no
+// callers there at all - so nothing in the engine allocated these before; the fork's submit node
+// replays a draw list's recorder blocks through them.
+#define SECONDARY_COMMAND_BUFFERS_PER_FRAME 8 // RenderingDeviceGraph::MAX_DRAW_RECORDERS
 
 #ifdef DEBUG_ENABLED
 

@@ -1158,6 +1158,18 @@ void RenderingDeviceGraph::_add_draw_list_begin(FramebufferCache *p_framebuffer_
 	workarounds_state.bound_any_draw_list_pipeline = false;
 }
 
+#ifdef MACRAME_ENABLED
+// MACRAME_SECONDARY=1 routes draw lists through secondary command buffers. Off by default until
+// the smoke test of 2.20.7 step 2 has cleared this machine's driver.
+bool RenderingDeviceGraph::macrame_secondary_replay() {
+	static const bool on = []() {
+		const char *env = std::getenv("MACRAME_SECONDARY");
+		return env != nullptr && atoi(env) != 0;
+	}();
+	return on;
+}
+#endif
+
 void RenderingDeviceGraph::_run_secondary_command_buffer_task(const SecondaryCommandBuffer *p_secondary) {
 	driver->command_buffer_begin_secondary(p_secondary->command_buffer, p_secondary->render_pass, 0, p_secondary->framebuffer);
 	_run_draw_list_command(p_secondary->command_buffer, p_secondary->instruction_data.ptr(), p_secondary->instruction_data.size());
@@ -1283,6 +1295,25 @@ void RenderingDeviceGraph::_run_render_commands(int32_t p_level, const RecordedC
 				}
 
 				if (framebuffer && render_pass) {
+#ifdef MACRAME_ENABLED
+					// Results 2.20.7 step 2, the NVIDIA smoke test: record this list into a
+					// secondary buffer and execute it, instead of recording straight into the
+					// primary. Serial and one buffer, so it should be slightly *slower*; what is
+					// being tested is that the frame is not black, because upstream parked this
+					// path over an unexplained black frame on NVIDIA and this machine is NVIDIA.
+					// Falls back to the primary once the frame's secondaries are spent.
+					if (macrame_secondary_replay() && frames[frame].secondary_command_buffers_used < frames[frame].secondary_command_buffers.size()) {
+						SecondaryCommandBuffer &secondary = frames[frame].secondary_command_buffers[frames[frame].secondary_command_buffers_used++];
+						driver->command_pool_reset(secondary.command_pool);
+						driver->command_buffer_begin_secondary(secondary.command_buffer, render_pass, 0, framebuffer);
+						_run_draw_list_command(secondary.command_buffer, draw_list_command->instruction_data(), draw_list_command->instruction_data_size);
+						driver->command_buffer_end(secondary.command_buffer);
+						driver->command_begin_render_pass(r_command_buffer, render_pass, framebuffer, RDD::COMMAND_BUFFER_TYPE_SECONDARY, draw_list_command->region, clear_values);
+						driver->command_buffer_execute_secondary(r_command_buffer, secondary.command_buffer);
+						driver->command_end_render_pass(r_command_buffer);
+						break;
+					}
+#endif
 					driver->command_begin_render_pass(r_command_buffer, render_pass, framebuffer, draw_list_command->command_buffer_type, draw_list_command->region, clear_values);
 					_run_draw_list_command(r_command_buffer, draw_list_command->instruction_data(), draw_list_command->instruction_data_size);
 					driver->command_end_render_pass(r_command_buffer);
