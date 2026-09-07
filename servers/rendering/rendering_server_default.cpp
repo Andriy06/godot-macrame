@@ -28,6 +28,7 @@
 /* SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.                 */
 /**************************************************************************/
 
+#include <cstdlib>
 #include "rendering_server_default.h"
 #include "core/macrame/macrame_canvas_stamp.h"
 #include "core/macrame/macrame_run_parity.h"
@@ -938,6 +939,49 @@ void RenderingServerDefault::_macrame_frame_boundary(bool p_present, double p_st
 	draw_seq++;
 	if (p_post_render) {
 		render_request = true;
+	}
+	// MACRAME_LIST_STATS=N reports the pipeline's per-set containers every N boundaries. They are
+	// the ones that can only grow (the cull sets' frame and snapshot pools, the job lists), so a
+	// runaway shows up here as a rising number with a name on it, and the bounds in
+	// `MacrameRenderLists` fault before the process fills memory.
+	static const int stats_every = []() {
+		const char *env = std::getenv("MACRAME_LIST_STATS");
+		return env != nullptr ? atoi(env) : 0;
+	}();
+	// The runaway-allocation watchdog. A soak run once reached 14 GB and died with a Windows
+	// fail-fast, no message and an empty stderr, and the cause was still open when this was
+	// written (2.18 row 17): it needs one of the exercise knobs, it happens within three seconds
+	// of the spawn, and neither the journal nor the pipeline's own containers are the ones
+	// growing. Whatever it is, it must not be silent again: past the bound the process crashes
+	// naming the run, the working set and every container this pipeline owns. The bound is far
+	// above the scene's honest 2.9 GB and far below the 8-14 GB the runaway reached.
+	static const uint64_t watchdog_mb = []() {
+		const char *env = std::getenv("MACRAME_MEMORY_WATCHDOG_MB");
+		return env != nullptr ? uint64_t(atoll(env)) : uint64_t(6144);
+	}();
+	if (watchdog_mb > 0 && (draw_seq % 30) == 0) {
+		const uint64_t used = OS::get_singleton()->get_process_memory_usage();
+		if (used > watchdog_mb * 1024 * 1024) {
+			String sets;
+			for (int i = 0; i < CULL_SETS; i++) {
+				const MacrameRenderLists &l = cull_sets[i].lists;
+				sets += vformat(" set%d[state=%d pool=%d snaps=%d entries=%d vps=%d probes=%d gi=%d hf=%d used=%d]",
+						i, int(cull_sets[i].state), l.pool.size(), l.snapshot_pool.size(), l.entries.size(),
+						l.viewports.size(), l.probe_jobs.size(), l.voxel_gi_jobs.size(), l.heightfield_jobs.size(), l.frames_used);
+			}
+			CRASH_NOW_MSG(vformat("Macrame: the process working set passed %d MB (%d MB) at run %d: something is allocating without a bound. Cull sets:%s",
+					watchdog_mb, used / (1024 * 1024), draw_seq, sets));
+		}
+	}
+	if (stats_every > 0 && (draw_seq % uint64_t(stats_every)) == 0) {
+		String line = "MACRAME_LIST_STATS run=" + itos(draw_seq);
+		for (int i = 0; i < CULL_SETS; i++) {
+			const MacrameRenderLists &l = cull_sets[i].lists;
+			line += vformat(" | set%d state=%d pool=%d snaps=%d entries=%d vps=%d probes=%d gi=%d hf=%d used=%d",
+					i, int(cull_sets[i].state), l.pool.size(), l.snapshot_pool.size(), l.entries.size(),
+					l.viewports.size(), l.probe_jobs.size(), l.voxel_gi_jobs.size(), l.heightfield_jobs.size(), l.frames_used);
+		}
+		print_line(line);
 	}
 }
 

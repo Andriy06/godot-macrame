@@ -302,6 +302,9 @@ public:
 	virtual void initialize_debugging() {}
 
 	virtual uint64_t get_static_memory_usage() const;
+	// The process working set, for the render pipeline's runaway-allocation watchdog. 0 where the
+	// platform does not report it.
+	virtual uint64_t get_process_memory_usage() const { return 0; }
 	virtual uint64_t get_static_memory_peak_usage() const;
 	virtual Dictionary get_memory_info() const;
 

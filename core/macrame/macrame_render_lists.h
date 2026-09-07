@@ -52,6 +52,15 @@ struct MacrameRenderLists {
 		RID viewport;
 		RenderSceneCullFrame *frame = nullptr;
 	};
+	// A run's cull takes a handful of frames: one per visible viewport, six per reflection probe
+	// face, one per voxel GI, one per particle heightfield. The pool is per cull set and only
+	// grows, so a run that asks for more than a scene can legitimately need is a runaway: without
+	// a bound each extra frame is a full `RenderSceneCullFrame` (paged arrays for every culled
+	// instance, megabytes at this scale) and the process fills memory in seconds and dies with a
+	// fail-fast and no message. Name it here instead.
+	static constexpr uint32_t MAX_CULL_FRAMES = 64;
+	static constexpr uint32_t MAX_JOBS = 256;
+
 	LocalVector<Entry> entries; // The frames culled this run.
 	LocalVector<RenderSceneCullFrame *> pool; // Every frame this value owns; `entries` point into it.
 	uint32_t frames_used = 0; // How many of `pool` this run's cull took.

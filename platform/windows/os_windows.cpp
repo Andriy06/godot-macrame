@@ -1244,6 +1244,14 @@ PackedByteArray OS_Windows::string_to_multibyte(const String &p_encoding, const 
 	return ret;
 }
 
+uint64_t OS_Windows::get_process_memory_usage() const {
+	PROCESS_MEMORY_COUNTERS pmc;
+	if (GetProcessMemoryInfo(GetCurrentProcess(), &pmc, sizeof(pmc))) {
+		return uint64_t(pmc.WorkingSetSize);
+	}
+	return 0;
+}
+
 Dictionary OS_Windows::get_memory_info() const {
 	Dictionary meminfo;
 

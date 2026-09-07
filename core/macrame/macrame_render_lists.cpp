@@ -30,9 +30,13 @@
 
 #include "macrame_render_lists.h"
 
+#include "core/error/error_macros.h"
+#include "core/string/ustring.h"
+
 #include "servers/rendering/rendering_method.h"
 
 RenderSceneCullFrame *MacrameRenderLists::acquire(RenderingMethod *p_scene, uint32_t p_index) {
+	CRASH_COND_MSG(p_index >= MAX_CULL_FRAMES, "Macrame: a run's cull asked for more than " + itos(MAX_CULL_FRAMES) + " cull frames (index " + itos(p_index) + "): the set's frame pool is running away.");
 	while (p_index >= pool.size()) {
 		RenderSceneCullFrame *f = p_scene->cull_frame_create();
 		if (!f) {
