@@ -5423,6 +5423,7 @@ void RenderForwardClustered::run_data_free(void *p_run_data) {
 	if (p_run_data) {
 		RunData *r = static_cast<RunData *>(p_run_data);
 		apply_run_data(r); // Whatever it still holds.
+		_delete_awaiting_instances(); // The teardown: nothing is in flight, no run of grace to wait for.
 		memdelete(r);
 	}
 }
@@ -5464,6 +5465,14 @@ void RenderForwardClustered::collect_run_data(void *p_run_data) {
 	pending_instance_frees.clear();
 }
 
+void RenderForwardClustered::_delete_awaiting_instances() {
+	for (GeometryInstanceForwardClustered *gi : instances_awaiting_delete) {
+		memdelete(gi->data);
+		geometry_instance_alloc.free(gi);
+	}
+	instances_awaiting_delete.clear();
+}
+
 // The record node, at the head of the frame the run value belongs to: by now no recorded frame
 // names what the update freed, and the new surfaces join the compilation lists.
 void RenderForwardClustered::apply_run_data(void *p_run_data) {
@@ -5492,9 +5501,10 @@ void RenderForwardClustered::apply_run_data(void *p_run_data) {
 		}
 	}
 	r->transforms_refresh.clear();
+	// One more run of grace before the struct goes: see `instances_awaiting_delete`.
+	_delete_awaiting_instances();
 	for (GeometryInstanceForwardClustered *gi : r->instance_frees) {
-		memdelete(gi->data);
-		geometry_instance_alloc.free(gi);
+		instances_awaiting_delete.push_back(gi);
 	}
 	r->new_surfaces.clear();
 	r->surface_frees.clear();

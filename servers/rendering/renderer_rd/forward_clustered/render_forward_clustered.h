@@ -833,6 +833,16 @@ private:
 	// deferred to the next update, by run parity; see RendererSceneCull::deferred_instance_updates.
 	LocalVector<GeometryInstanceForwardClustered *> deferred_dirty_marks[2];
 	int deferred_write = 0;
+	// A geometry instance the scene update freed outlives its last use by one more run than the
+	// frames that name it. The record node of a run may push an instance into the dirty-mark slot
+	// of that run (`_mark_dirty` reads `pending_free` without synchronisation, so it can miss a
+	// free the update node of the same run has just done), and the update node of the NEXT run
+	// walks that slot. Deleting the struct at the head of that next run's record node - which is
+	// what the pipeline used to do - is a use-after-free against that walk, and it is the one that
+	// corrupts the surface-cache allocator (results 2.18 row 17). So the batch waits here for one
+	// run: by the time it is deleted, the slot that could name it has been drained.
+	LocalVector<GeometryInstanceForwardClustered *> instances_awaiting_delete;
+	void _delete_awaiting_instances();
 	bool defer_frees = true; // Off from the destructor on: nothing is in flight, free at once.
 	void _defer_surface_free(GeometryInstanceSurfaceDataCache *p_surface) {
 		if (!defer_frees) {
@@ -964,7 +974,19 @@ public:
 	virtual void run_data_free(void *p_run_data) override;
 	virtual void collect_run_data(void *p_run_data) override;
 	virtual void apply_run_data(void *p_run_data) override;
-	virtual void macrame_run_boundary() override { deferred_write ^= 1; }
+	// The blue thread, between runs, with everything joined: the batch that the next record node
+	// will delete must be named by neither dirty-mark slot. That is the invariant the extra run of
+	// grace buys, made deterministic.
+	virtual void macrame_run_boundary() override {
+		for (GeometryInstanceForwardClustered *gi : instances_awaiting_delete) {
+			for (int slot = 0; slot < 2; slot++) {
+				for (GeometryInstanceForwardClustered *marked : deferred_dirty_marks[slot]) {
+					CRASH_COND_MSG(marked == gi, "Macrame: a geometry instance about to be deleted is still named by a deferred dirty mark (the update node would walk freed memory).");
+				}
+			}
+		}
+		deferred_write ^= 1;
+	}
 
 	RenderForwardClustered();
 	~RenderForwardClustered();
