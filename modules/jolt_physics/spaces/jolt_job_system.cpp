@@ -225,13 +225,36 @@ void JoltJobSystem::QueueJobs(JPH::JobSystem::Job **p_jobs, JPH::uint p_job_coun
 	}
 }
 
+ts::Parallel_options JoltJobSystem::_lane_options(int p_lanes) {
+	static const int pri = []() {
+		const char *env = std::getenv("MACRAME_JOLT_LANE_PRIORITY");
+		return env != nullptr ? atoi(env) : 0; // low by default: take idle capacity, not the shards'.
+	}();
+	ts::Parallel_options opts{ .max_workers = p_lanes, .balance = ts::Balance::unbalanced };
+	switch (pri) {
+		case 0:
+			opts.priority = ts::Priority::low;
+			break;
+		case 1:
+			opts.priority = ts::Priority::normal;
+			break;
+		case 2:
+			opts.priority = ts::Priority::high;
+			break;
+		default:
+			break; // Inherit the step node's priority (high).
+	}
+	return opts;
+}
+
 int JoltJobSystem::lane_count() {
-	// 0 or 1 keeps the old shape: every job inline on the calling thread. The default is chosen in
-	// 2.24 by measurement - the step shares the tick frame with the frame shards, so taking every
-	// worker is not automatically best (2.21's lesson: check the node you did not change).
+	// 0 or 1 keeps the old shape: every job inline on the calling thread. Four is the measured
+	// default (2.24.8): the step's window has ~18 of 21 workers idle, so there is capacity to take,
+	// but more lanes is not better - eight and twenty-two both lose to four on the tick frame's run
+	// on this workload, which is small for Jolt (~300 dynamic bodies).
 	static const int lanes = []() {
 		const char *env = std::getenv("MACRAME_JOLT_LANES");
-		return env != nullptr ? atoi(env) : 0;
+		return env != nullptr ? atoi(env) : 4;
 	}();
 	return lanes;
 }

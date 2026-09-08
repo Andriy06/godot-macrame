@@ -155,6 +155,13 @@ class JoltJobSystem final : public JPH::JobSystemWithBarrier {
 	// (every job inline on the caller); the default is set by measurement in results 2.24.
 	static int lane_count();
 
+	// The lane fan-out's queue priority. `Parallel_options::priority` defaults to *inheriting* the
+	// calling task's, and the physics step node is registered `Priority::high` - so lanes would be
+	// dispatched high and picked ahead of the very frame shards and navigation they share the
+	// frame with, which is backwards for a node that wants only the capacity nobody else needs.
+	// MACRAME_JOLT_LANE_PRIORITY: 0 low (default), 1 normal, 2 high, -1 inherit.
+	static ts::Parallel_options _lane_options(int p_lanes);
+
 public:
 	JoltJobSystem();
 
@@ -199,7 +206,7 @@ public:
 						_run_lane();
 					}
 				},
-				ts::Parallel_options{ .max_workers = lanes, .balance = ts::Balance::unbalanced });
+				_lane_options(lanes));
 		lanes_open = false;
 		_drain_ready(); // Anything a late release left behind; normally a no-op.
 	}
