@@ -38,6 +38,12 @@
 
 #include <Jolt/Physics/PhysicsSettings.h>
 
+#ifdef MACRAME_ENABLED
+#include "ts/parallel_for.h"
+#endif
+
+#include <cstdlib>
+
 void JoltJobSystem::Job::_execute(void *p_user_data) {
 	Job *job = static_cast<Job *>(p_user_data);
 
@@ -106,8 +112,57 @@ void JoltJobSystem::Job::queue() {
 	task_id = WorkerThreadPool::get_singleton()->add_native_task(&_execute, this, true, task_name);
 }
 
+#ifdef MACRAME_ENABLED
+
+void JoltJobSystem::_push_ready(Job *p_job) {
+	p_job->AddRef(); // Released by whichever lane executes it.
+	const uint32_t slot = queue_tail.fetch_add(1, std::memory_order_relaxed);
+	CRASH_COND_MSG(slot >= QUEUE_LENGTH, "Macrame: the Jolt ready ring overflowed in one step.");
+	queue_slots[slot & (QUEUE_LENGTH - 1)].store(p_job, std::memory_order_release);
+	lane_semaphore.Release();
+}
+
+// Take and run whatever is ready right now. Each slot is claimed by exchange, so a job runs once
+// however many lanes walk the ring.
+void JoltJobSystem::_drain_ready() {
+	const uint32_t tail = queue_tail.load(std::memory_order_acquire);
+	for (uint32_t i = 0; i < tail && i < QUEUE_LENGTH; i++) {
+		std::atomic<Job *> &slot = queue_slots[i];
+		if (slot.load(std::memory_order_acquire) == nullptr) {
+			continue;
+		}
+		Job *job = slot.exchange(nullptr, std::memory_order_acq_rel);
+		if (job != nullptr) {
+			job->Execute();
+			job->Release();
+		}
+	}
+}
+
+void JoltJobSystem::_run_lane() {
+	while (!lanes_quit.load(std::memory_order_acquire)) {
+		lane_semaphore.Acquire();
+		_drain_ready();
+	}
+	_drain_ready();
+}
+
+#endif // MACRAME_ENABLED
+
 int JoltJobSystem::GetMaxConcurrency() const {
-	return thread_count;
+	// Macrame: Jolt sizes every split it makes by this number. Answering 22 while the worker pool
+	// runs every queued job inline on the caller means Jolt builds 22-way splits and then executes
+	// all 22 of them serially, paying the job overhead for width it never gets. The override lets
+	// the honest answer be measured against the flattering one.
+	static const int override_count = []() {
+		const char *env = std::getenv("MACRAME_JOLT_CONCURRENCY");
+		return env != nullptr ? atoi(env) : 0;
+	}();
+	if (override_count > 0) {
+		return override_count;
+	}
+	const int lanes = lane_count();
+	return lanes > 1 ? lanes : thread_count;
 }
 
 JPH::JobHandle JoltJobSystem::CreateJob(const char *p_name, JPH::ColorArg p_color, const JPH::JobSystem::JobFunction &p_job_function, JPH::uint32 p_dependency_count) {
@@ -131,7 +186,15 @@ JPH::JobHandle JoltJobSystem::CreateJob(const char *p_name, JPH::ColorArg p_colo
 	// This will increment the job's reference count, so must happen before we queue the job
 	JPH::JobHandle job_handle(job);
 
+	if (stats_every > 0) {
+		census.jobs_created++;
+		census.by_name[static_cast<const void *>(p_name)]++;
+	}
+
 	if (p_dependency_count == 0) {
+		if (stats_every > 0) {
+			census.queued_at_create++;
+		}
 		QueueJob(job);
 	}
 
@@ -139,13 +202,38 @@ JPH::JobHandle JoltJobSystem::CreateJob(const char *p_name, JPH::ColorArg p_colo
 }
 
 void JoltJobSystem::QueueJob(JPH::JobSystem::Job *p_job) {
+#ifdef MACRAME_ENABLED
+	if (lanes_open) {
+		_push_ready(static_cast<Job *>(p_job));
+		return;
+	}
+#endif
 	static_cast<Job *>(p_job)->queue();
 }
 
 void JoltJobSystem::QueueJobs(JPH::JobSystem::Job **p_jobs, JPH::uint p_job_count) {
+	// Jolt hands a whole wave of newly-ready jobs here at once (`JobHandle::sRemoveDependencies`
+	// batches them): a step is five such waves, three of them 22 jobs wide. They go on the ready
+	// ring for the lanes to take; Jolt decides what may run when, we only say where it runs.
+	if (stats_every > 0) {
+		census.batches++;
+		census.batched_jobs += p_job_count;
+		census.batch_hist[MIN(p_job_count, uint32_t(32))]++;
+	}
 	for (JPH::uint i = 0; i < p_job_count; ++i) {
 		QueueJob(p_jobs[i]);
 	}
+}
+
+int JoltJobSystem::lane_count() {
+	// 0 or 1 keeps the old shape: every job inline on the calling thread. The default is chosen in
+	// 2.24 by measurement - the step shares the tick frame with the frame shards, so taking every
+	// worker is not automatically best (2.21's lesson: check the node you did not change).
+	static const int lanes = []() {
+		const char *env = std::getenv("MACRAME_JOLT_LANES");
+		return env != nullptr ? atoi(env) : 0;
+	}();
+	return lanes;
 }
 
 void JoltJobSystem::FreeJob(JPH::JobSystem::Job *p_job) {
@@ -164,12 +252,43 @@ JoltJobSystem::JoltJobSystem() :
 	jobs.Init(JPH::cMaxPhysicsJobs, JPH::cMaxPhysicsJobs);
 }
 
+void JoltJobSystem::Census::report(int p_concurrency) {
+	String line = vformat("MACRAME_JOLT_STATS steps=%d concurrency=%d jobs/step=%.1f queued_at_create/step=%.1f |",
+			steps, p_concurrency, double(jobs_created) / double(steps), double(queued_at_create) / double(steps));
+	for (const KeyValue<const void *, uint64_t> &E : by_name) {
+		line += vformat(" %s=%.1f", static_cast<const char *>(E.key), double(E.value) / double(steps));
+	}
+	String hist;
+	for (const KeyValue<uint32_t, uint64_t> &E : batch_hist) {
+		hist += vformat(" %d:%.1f", E.key, double(E.value) / double(steps));
+	}
+	print_line(line);
+	print_line(vformat("MACRAME_JOLT_STATS batches/step=%.1f batched_jobs/step=%.1f | batch sizes/step:%s",
+			double(batches) / double(steps), double(batched_jobs) / double(steps), hist));
+	steps = 0;
+	jobs_created = 0;
+	queued_at_create = 0;
+	batches = 0;
+	batched_jobs = 0;
+	by_name.clear();
+	batch_hist.clear();
+}
+
 void JoltJobSystem::pre_step() {
-	// Nothing to do.
+	if (stats_every < 0) {
+		const char *env = std::getenv("MACRAME_JOLT_STATS");
+		stats_every = env != nullptr ? atoi(env) : 0;
+	}
 }
 
 void JoltJobSystem::post_step() {
 	_reclaim_jobs();
+	if (stats_every > 0) {
+		census.steps++;
+		if (census.steps >= uint64_t(stats_every)) {
+			census.report(GetMaxConcurrency());
+		}
+	}
 }
 
 #ifdef DEBUG_ENABLED

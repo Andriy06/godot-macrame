@@ -30,6 +30,8 @@
 
 #include "jolt_space_3d.h"
 
+#include "jolt_job_system.h"
+
 #include "../joints/jolt_joint_3d.h"
 #include "core/profiling/profiling.h" // [perf-zones]
 #include "../jolt_physics_server_3d.h"
@@ -195,7 +197,17 @@ void JoltSpace3D::step(float p_step) {
 
 	_pre_step(p_step);
 
+#ifdef MACRAME_ENABLED
+	// The lanes live exactly as long as this call: Jolt's own job graph, executed on Macrame
+	// workers instead of inline on the calling thread. `_pre_step` and `_post_step` stay serial -
+	// they are Godot-side bookkeeping, not Jolt's.
+	JPH::EPhysicsUpdateError update_error = JPH::EPhysicsUpdateError::None;
+	static_cast<JoltJobSystem *>(job_system)->run_with_lanes([&]() {
+		update_error = physics_system->Update(p_step, 1, temp_allocator, job_system);
+	});
+#else
 	const JPH::EPhysicsUpdateError update_error = physics_system->Update(p_step, 1, temp_allocator, job_system);
+#endif
 
 	if ((update_error & JPH::EPhysicsUpdateError::ManifoldCacheFull) != JPH::EPhysicsUpdateError::None) {
 		WARN_PRINT_ONCE(vformat("Jolt Physics manifold cache exceeded capacity and contacts were ignored. "
