@@ -34,6 +34,7 @@
 #include "core/macrame/macrame_phase_probe.h"
 #include "core/macrame/macrame_render_grant.h"
 #include "ts/access.h"
+#include "ts/parallel_for.h"
 #endif
 
 #define PRINT_RENDER_GRAPH 0
@@ -1156,6 +1157,10 @@ void RenderingDeviceGraph::_add_draw_list_begin(FramebufferCache *p_framebuffer_
 #endif
 
 	workarounds_state.bound_any_draw_list_pipeline = false;
+#ifdef MACRAME_ENABLED
+	draw_instruction_list.has_viewport = false;
+	draw_instruction_list.has_scissor = false;
+#endif
 }
 
 #ifdef MACRAME_ENABLED
@@ -1167,6 +1172,33 @@ bool RenderingDeviceGraph::macrame_secondary_replay() {
 		return env != nullptr && atoi(env) != 0;
 	}();
 	return on;
+}
+#endif
+
+#ifdef MACRAME_ENABLED
+// One recorder block into its own secondary buffer. Dynamic state does not survive a secondary
+// boundary: in the concatenated stream every block after the first inherits the viewport and
+// scissor recorder 0 set, so replaying them separately has to set that state again, from block 0's
+// own instructions (results 2.20.7 step 3 - the step that would otherwise draw silently with the
+// wrong viewport, which is why the screenshot is its acceptance).
+void RenderingDeviceGraph::_macrame_record_block(const RecordedDrawListCommand *p_command, uint32_t p_block, RDD::RenderPassID p_render_pass, RDD::FramebufferID p_framebuffer, SecondaryCommandBuffer &r_secondary) {
+	// Each block has its own pool, so resetting it here touches nothing another chunk owns.
+	driver->command_pool_reset(r_secondary.command_pool);
+	driver->command_buffer_begin_secondary(r_secondary.command_buffer, p_render_pass, 0, p_framebuffer);
+
+	if (p_block > 0) {
+		// Block 0's dynamic state, captured when it was recorded. Blocks after the first inherit
+		// it in the concatenated stream and would otherwise start with none of it.
+		if (p_command->has_viewport) {
+			driver->command_render_set_viewport(r_secondary.command_buffer, p_command->viewport);
+		}
+		if (p_command->has_scissor) {
+			driver->command_render_set_scissor(r_secondary.command_buffer, p_command->scissor);
+		}
+	}
+
+	_run_draw_list_command(r_secondary.command_buffer, p_command->instruction_data() + p_command->block_offset[p_block], p_command->block_size[p_block]);
+	driver->command_buffer_end(r_secondary.command_buffer);
 }
 #endif
 
@@ -1296,20 +1328,33 @@ void RenderingDeviceGraph::_run_render_commands(int32_t p_level, const RecordedC
 
 				if (framebuffer && render_pass) {
 #ifdef MACRAME_ENABLED
-					// Results 2.20.7 step 2, the NVIDIA smoke test: record this list into a
-					// secondary buffer and execute it, instead of recording straight into the
-					// primary. Serial and one buffer, so it should be slightly *slower*; what is
-					// being tested is that the frame is not black, because upstream parked this
-					// path over an unexplained black frame on NVIDIA and this machine is NVIDIA.
-					// Falls back to the primary once the frame's secondaries are spent.
-					if (macrame_secondary_replay() && frames[frame].secondary_command_buffers_used < frames[frame].secondary_command_buffers.size()) {
-						SecondaryCommandBuffer &secondary = frames[frame].secondary_command_buffers[frames[frame].secondary_command_buffers_used++];
-						driver->command_pool_reset(secondary.command_pool);
-						driver->command_buffer_begin_secondary(secondary.command_buffer, render_pass, 0, framebuffer);
-						_run_draw_list_command(secondary.command_buffer, draw_list_command->instruction_data(), draw_list_command->instruction_data_size);
-						driver->command_buffer_end(secondary.command_buffer);
+					// Results 2.20.7 step 4. The recording side already split this list across
+					// draw recorders; replay their blocks into one secondary command buffer each,
+					// in parallel, and execute them into the primary in recorder order. The sort,
+					// the barriers, the non-draw commands and the queue submit all stay on this
+					// node - only the per-draw `vkCmd*` emission fans out, which is the 3.0 ms of
+					// the submit node's 3.6.
+					//
+					// Each chunk owns its slot by the loop index, which is what makes an exclusive
+					// command pool per chunk sound without a lock or a thread-local: `parallel_for`
+					// is called with one chunk per block, and the pools are indexed by block.
+					const uint32_t blocks = draw_list_command->block_count;
+					if (macrame_secondary_replay() && blocks > 1 && (frames[frame].secondary_command_buffers_used + blocks) <= frames[frame].secondary_command_buffers.size()) {
+						const uint32_t base = frames[frame].secondary_command_buffers_used;
+						frames[frame].secondary_command_buffers_used += blocks;
+						ts::parallel_for((int)blocks, [&](int p_block) {
+							_macrame_record_block(draw_list_command, uint32_t(p_block), render_pass, framebuffer, frames[frame].secondary_command_buffers[base + p_block]);
+						}, ts::Parallel_options{ .max_workers = int(blocks), .balance = ts::Balance::unbalanced,
+								// Low, not the submit node's inherited high: this fan-out wants the
+								// capacity the record node beside it is not using (results 2.24.5).
+								.priority = ts::Priority::low });
+
+						RDD::CommandBufferID buffers[MAX_DRAW_RECORDERS];
+						for (uint32_t b = 0; b < blocks; b++) {
+							buffers[b] = frames[frame].secondary_command_buffers[base + b].command_buffer;
+						}
 						driver->command_begin_render_pass(r_command_buffer, render_pass, framebuffer, RDD::COMMAND_BUFFER_TYPE_SECONDARY, draw_list_command->region, clear_values);
-						driver->command_buffer_execute_secondary(r_command_buffer, secondary.command_buffer);
+						driver->command_buffer_execute_secondary(r_command_buffer, VectorView<RDD::CommandBufferID>(buffers, blocks));
 						driver->command_end_render_pass(r_command_buffer);
 						break;
 					}
@@ -2423,12 +2468,24 @@ void RenderingDeviceGraph::add_draw_list_set_scissor(uint32_t p_recorder, Rect2i
 	DrawListSetScissorInstruction *instruction = reinterpret_cast<DrawListSetScissorInstruction *>(_allocate_draw_list_instruction(p_recorder, sizeof(DrawListSetScissorInstruction)));
 	instruction->type = DrawListInstruction::TYPE_SET_SCISSOR;
 	instruction->rect = p_rect;
+#ifdef MACRAME_ENABLED
+	if (p_recorder == 0) {
+		draw_instruction_list.has_scissor = true;
+		draw_instruction_list.scissor = p_rect;
+	}
+#endif
 }
 
 void RenderingDeviceGraph::add_draw_list_set_viewport(uint32_t p_recorder, Rect2i p_rect) {
 	DrawListSetViewportInstruction *instruction = reinterpret_cast<DrawListSetViewportInstruction *>(_allocate_draw_list_instruction(p_recorder, sizeof(DrawListSetViewportInstruction)));
 	instruction->type = DrawListInstruction::TYPE_SET_VIEWPORT;
 	instruction->rect = p_rect;
+#ifdef MACRAME_ENABLED
+	if (p_recorder == 0) {
+		draw_instruction_list.has_viewport = true;
+		draw_instruction_list.viewport = p_rect;
+	}
+#endif
 }
 
 void RenderingDeviceGraph::add_draw_list_uniform_set_prepare_for_use(uint32_t p_recorder, RDD::ShaderID p_shader, RDD::UniformSetID p_uniform_set, uint32_t set_index) {
@@ -2484,6 +2541,17 @@ void RenderingDeviceGraph::set_draw_recorder_count(uint32_t p_count) {
 void RenderingDeviceGraph::add_draw_list_end() {
 	// Concatenate what the parallel recorders appended, in recorder order, so the instruction
 	// stream is exactly the one a single recorder would have produced for the same element ranges.
+#ifdef MACRAME_ENABLED
+	// Block 0 is what recorder 0 wrote directly into the list; the others are appended below.
+	uint32_t macrame_block_count = 0;
+	uint32_t macrame_block_offset[MAX_DRAW_RECORDERS] = {};
+	uint32_t macrame_block_size[MAX_DRAW_RECORDERS] = {};
+	if (draw_instruction_list.data.size() > 0) {
+		macrame_block_offset[0] = 0;
+		macrame_block_size[0] = draw_instruction_list.data.size();
+		macrame_block_count = 1;
+	}
+#endif
 	if (draw_recorder_count > 1) {
 		for (uint32_t i = 1; i < draw_recorder_count; i++) {
 			DrawRecorder &r = draw_recorders[i - 1];
@@ -2495,6 +2563,13 @@ void RenderingDeviceGraph::add_draw_list_end() {
 				const uint32_t offset = GRAPH_ALIGN(draw_instruction_list.data.size());
 				draw_instruction_list.data.resize(offset + instruction_size);
 				memcpy(&draw_instruction_list.data[offset], r.data.ptr(), instruction_size);
+#ifdef MACRAME_ENABLED
+				if (macrame_block_count < MAX_DRAW_RECORDERS) {
+					macrame_block_offset[macrame_block_count] = offset;
+					macrame_block_size[macrame_block_count] = instruction_size;
+					macrame_block_count++;
+				}
+#endif
 			}
 			draw_instruction_list.stages = draw_instruction_list.stages | r.stages;
 			for (uint32_t j = 0; j < r.trackers.size(); j++) {
@@ -2525,6 +2600,17 @@ void RenderingDeviceGraph::add_draw_list_end() {
 	command->breadcrumb = draw_instruction_list.breadcrumb;
 #endif
 	command->split_cmd_buffer = draw_instruction_list.split_cmd_buffer;
+#ifdef MACRAME_ENABLED
+	command->block_count = macrame_block_count;
+	command->has_viewport = draw_instruction_list.has_viewport;
+	command->has_scissor = draw_instruction_list.has_scissor;
+	command->viewport = draw_instruction_list.viewport;
+	command->scissor = draw_instruction_list.scissor;
+	for (uint32_t i = 0; i < macrame_block_count; i++) {
+		command->block_offset[i] = macrame_block_offset[i];
+		command->block_size[i] = macrame_block_size[i];
+	}
+#endif
 	command->clear_values_count = draw_instruction_list.attachment_clear_values.size();
 	command->trackers_count = trackers_count;
 

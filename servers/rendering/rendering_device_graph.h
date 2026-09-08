@@ -334,6 +334,14 @@ private:
 		uint32_t breadcrumb;
 #endif
 		bool split_cmd_buffer = false;
+#ifdef MACRAME_ENABLED
+		// The dynamic state recorder 0 set for this list, kept as it is recorded so a block
+		// replayed into its own secondary can be given it explicitly (results 2.20.7 step 3).
+		bool has_viewport = false;
+		bool has_scissor = false;
+		Rect2i viewport;
+		Rect2i scissor;
+#endif
 	};
 
 	struct RecordedCommandSort {
@@ -460,6 +468,22 @@ private:
 		uint32_t breadcrumb = 0;
 #endif
 		bool split_cmd_buffer = false;
+
+#ifdef MACRAME_ENABLED
+		// The recorder blocks of this list, as byte ranges into `instruction_data()` (results
+		// 2.20.7 step 3). `add_draw_list_end` concatenates what the parallel recorders produced,
+		// and this is where each one starts and ends, so the submit node can replay them into
+		// separate secondary command buffers instead of walking one stream. Block 0 is recorder
+		// 0's, which also carries the dynamic state the others inherit when they are one stream
+		// and must be given explicitly when they are not.
+		uint32_t block_count = 0;
+		uint32_t block_offset[MAX_DRAW_RECORDERS] = {};
+		uint32_t block_size[MAX_DRAW_RECORDERS] = {};
+		bool has_viewport = false;
+		bool has_scissor = false;
+		Rect2i viewport;
+		Rect2i scissor;
+#endif
 
 		_FORCE_INLINE_ RDD::RenderPassClearValue *clear_values() {
 			return reinterpret_cast<RDD::RenderPassClearValue *>(&this[1]);
@@ -921,6 +945,8 @@ private:
 	void _run_secondary_command_buffer_task(const SecondaryCommandBuffer *p_secondary);
 #ifdef MACRAME_ENABLED
 	static bool macrame_secondary_replay();
+	// Replays one recorder block into its own secondary buffer, dynamic state first.
+	void _macrame_record_block(const RecordedDrawListCommand *p_command, uint32_t p_block, RDD::RenderPassID p_render_pass, RDD::FramebufferID p_framebuffer, SecondaryCommandBuffer &r_secondary);
 #endif
 	void _wait_for_secondary_command_buffer_tasks();
 	void _run_render_commands(int32_t p_level, const RecordedCommandSort *p_sorted_commands, uint32_t p_sorted_commands_count, RDD::CommandBufferID &r_command_buffer, CommandBufferPool &r_command_buffer_pool, int32_t &r_current_label_index, int32_t &r_current_label_level);
