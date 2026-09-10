@@ -20,7 +20,5 @@ I could construct a better sample/benchmark project and get much more impressive
 
 The library: [Macrame](https://github.com/macrame-ts/macrame)
 
-The Godot fork: [Andriy06/godot, `macrame` branch](https://github.com/Andriy06/godot/tree/macrame)
-
 > [!WARNING]
 > **Disclaimer:** This was an experiment, an exercise, and the fork is not suitable to be used in production. I won't try to merge any of this into Godot, for many reasons, one of them is that this work was heavily assisted by AI, and Godot doesn't accept this kind of contribution.
