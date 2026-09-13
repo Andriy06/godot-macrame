@@ -510,6 +510,11 @@ void _body_sync() {
 	if (state->frame.tree && state->frame.tree->is_physics_interpolation_enabled()) {
 		return; // The head delivers them, after `iteration_prepare` has snapshotted the transforms.
 	}
+	// MACRAME_BODY_SYNC=0 leaves them to the head as well: an isolating knob for A/B work.
+	static const bool enabled = OS::get_singleton()->get_environment("MACRAME_BODY_SYNC") != "0";
+	if (!enabled) {
+		return;
+	}
 	ScriptServer::thread_enter();
 	set_context(-1, true, FAMILY_WRITE);
 	static_cast<PhysicsServer3DWrapMT *>(PhysicsServer3D::get_singleton())->macrame_flush_queries_under_grant();
