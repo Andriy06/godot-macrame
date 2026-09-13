@@ -93,6 +93,21 @@ void PhysicsServer3DWrapMT::macrame_step_under_grant(real_t p_step) {
 #endif
 }
 
+void PhysicsServer3DWrapMT::macrame_flush_queries_under_grant() {
+#ifdef MACRAME_ENABLED
+	// The main loop's head, in its order: apply what was staged since the step, add the pending
+	// objects and open the sync window the callbacks run in, deliver them, close it.
+	MacramePhysics::set_holds_grant(true);
+	command_queue.commit_under_grant();
+	physics_server_3d->sync();
+	physics_server_3d->flush_queries();
+	physics_server_3d->end_sync();
+	MacramePhysics::set_holds_grant(false);
+#else
+	flush_queries();
+#endif
+}
+
 void PhysicsServer3DWrapMT::sync() {
 #ifdef MACRAME_ENABLED
 	command_queue.sync(); // Join the step, apply the staged writes.

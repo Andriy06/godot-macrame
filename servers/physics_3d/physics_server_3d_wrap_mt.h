@@ -422,6 +422,9 @@ public:
 	// Macrame frame graph: the calling task holds the space's write grant (a graph node);
 	// apply the staged commands and step inline.
 	void macrame_step_under_grant(real_t p_step);
+	// Macrame frame graph: the calling task holds the space's write grant (the `body sync` node,
+	// after the step); deliver the step's state callbacks inline, as the main loop's head would.
+	void macrame_flush_queries_under_grant();
 	virtual void sync() override;
 	virtual void end_sync() override;
 	virtual void flush_queries() override;

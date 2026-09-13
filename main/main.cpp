@@ -4989,7 +4989,15 @@ bool Main::iteration() {
 #ifndef PHYSICS_3D_DISABLED
 		GodotProfileZoneGrouped(_physics_zone, "PhysicsServer3D::sync");
 		PhysicsServer3D::get_singleton()->sync();
+#ifdef MACRAME_ENABLED
+		// Macrame: when the last step ran in a frame graph, its `body sync` node already delivered
+		// the step's state callbacks at the tail of that run, so this tick's head does not.
+		if (!MacrameScene::frame_take_queries_flushed()) {
+			PhysicsServer3D::get_singleton()->flush_queries();
+		}
+#else
 		PhysicsServer3D::get_singleton()->flush_queries();
+#endif
 #endif // PHYSICS_3D_DISABLED
 
 #ifndef PHYSICS_2D_DISABLED

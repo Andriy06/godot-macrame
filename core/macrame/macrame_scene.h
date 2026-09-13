@@ -94,9 +94,9 @@ void run_groups(SceneTree *p_tree, void **p_groups, int p_group_count, bool p_ph
 // node bodies and the same guarded objects - no node ever runs as a no-op:
 //
 //   tick_frame  64 tick shards + physics step + navigation + 64 frame shards (edge i -> i)
-//                 + render + submit
+//                 + gather + body sync + render + submit
 //   plain_frame 64 frame shards (an iteration with no tick) + render + submit
-//   tick_only   64 tick shards + physics step + navigation (each catch-up tick)
+//   tick_only   64 tick shards + physics step + navigation + gather + body sync (each catch-up tick)
 //
 // An iteration with N ticks runs `tick_only` N-1 times inside the physics loop, then
 // `tick_frame` after the process phase; an iteration with no tick runs `plain_frame`.
@@ -104,6 +104,28 @@ void run_groups(SceneTree *p_tree, void **p_groups, int p_group_count, bool p_ph
 // its own physics phase is done, while the step and navigation run in the tick's tail. While
 // capturing, `run_groups()` records its batch for the graph instead of running it; the
 // blue-thread parts of the tree's phases run as before. MACRAME_FRAME_GRAPH=0 disables.
+//
+// Two nodes hold what used to be the next tick's serial head, where the blue thread ran it with the
+// graph stopped (0.88 ms of every tick frame, results 2.25.4). Both consume the tick's results, so
+// they run at the tail of the tick that produced them:
+// - `gather` runs the gather groups: a sub-thread process group whose owner set the `macrame_gather`
+//   meta before choosing its thread group reads every shard and writes the main shard (the town
+//   publishing its NPCs' state for the next tick's shards). It runs a gather group's
+//   `_physics_process` after every shard node of its run, so in `tick_frame` it sees the frame's
+//   process phase too, and runs empty in a scene without gather groups. A gather group's
+//   `_process` runs on the blue thread after the run, and outside the frame graph the blue thread
+//   runs gather groups once the batch is joined, so `plain_frame` stays the graph it was: an empty
+//   node there cost plain frames ~0.1 ms.
+// - `body sync` delivers the step's state callbacks (`PhysicsServer3D::flush_queries`: every moved
+//   rigid body told its new transform) right after the step, and after every frame shard, so
+//   `_process` still sees the previous tick's transforms, as in stock Godot. The renderer sees them
+//   a tick earlier. With physics interpolation on it leaves them to the head, which must snapshot
+//   the transforms first.
+//
+// Both write the main shard, and every shard node reads it, so no shard node runs beside either.
+// That makes the main shard's write grant the "every shard" grant a node could not otherwise
+// declare (at most eight objects a node, and there are 64 shards): the harness accepts it for a
+// read of any shard's node (`gather`) or also a write (`body sync`).
 bool frame_graph_enabled();
 void frame_set_capturing(bool p_capturing);
 void frame_set_tick(double p_step); // The step this tick's `physics step` and `navigation` nodes use.
@@ -128,4 +150,7 @@ void frame_set_graph_running(bool p_running);
 // Which graph the current run belongs to: 0 plain_frame, 1 tick_frame, 2 tick_only, 3 none. Set by
 // the blue thread before `execute()`, read by node bodies (the render phase probe).
 int frame_graph_kind();
+// Whether the last run's `body sync` delivered the step's state callbacks, so the next tick's head
+// must not (`Main::iteration`). Clears the flag.
+bool frame_take_queries_flushed();
 } // namespace MacrameScene

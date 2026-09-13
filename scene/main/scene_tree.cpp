@@ -1424,7 +1424,11 @@ void SceneTree::_add_process_group(Node *p_node) {
 
 	pg->owner = p_node;
 #ifdef MACRAME_ENABLED
-	pg->macrame_shard = MacrameScene::assign_shard();
+	// A node that sets the `macrame_gather` meta before it picks a sub-thread group asks for a
+	// gather group: it reads every shard and writes the main shard, so its nodes count as
+	// main-shard nodes and it takes no shard of its own (see `MacrameScene`, the gather node).
+	pg->macrame_gather = p_node->has_meta(SNAME("macrame_gather"));
+	pg->macrame_shard = pg->macrame_gather ? -1 : MacrameScene::assign_shard();
 #endif
 	p_node->data.process_group = pg;
 

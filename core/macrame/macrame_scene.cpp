@@ -92,6 +92,8 @@ struct NavGrantToken {
 struct FrameState {
 	std::vector<std::vector<void *>> tick_buckets;
 	std::vector<std::vector<void *>> frame_buckets;
+	std::vector<void *> gather_tick_groups; // Gather groups captured in the tick's physics phase,
+	std::vector<void *> gather_frame_groups; // and in the frame's process phase.
 	SceneTree *tree = nullptr;
 	bool capturing = false;
 	double tick_step = 0.0;
@@ -143,6 +145,7 @@ State *state = nullptr;
 MacrameScene::FrameNodeAdder render_node_adder = nullptr;
 bool graph_running = false;
 int graph_kind = 3;
+bool queries_flushed = false; // Set by `body sync` on a worker, read after the run's join.
 void _write_phase_trace(PhaseGraph &pg);
 void _write_frame_trace(FrameGraph &fg);
 namespace {
@@ -166,9 +169,20 @@ thread_local int macrame_tls_current_shard = -1;
 thread_local bool macrame_tls_in_shard_task = false;
 
 namespace {
-MACRAME_NO_INLINE void set_context(int p_shard, bool p_in_task) {
+// What a task that is not a shard may do with the shards' nodes by holding the main shard's write
+// grant, which excludes every shard node (see macrame_scene.h): read any of them (`gather`), or
+// write them too (`body sync`).
+enum FamilyAccess {
+	FAMILY_NONE,
+	FAMILY_READ,
+	FAMILY_WRITE,
+};
+thread_local FamilyAccess tls_family_access = FAMILY_NONE;
+
+MACRAME_NO_INLINE void set_context(int p_shard, bool p_in_task, FamilyAccess p_family = FAMILY_NONE) {
 	macrame_tls_current_shard = p_shard;
 	macrame_tls_in_shard_task = p_in_task;
+	tls_family_access = p_family;
 }
 } // namespace
 
@@ -262,6 +276,10 @@ void MacrameScene::check_write(const Node *p_node) {
 		return;
 	}
 	const int s = SceneTree::macrame_shard_of(p_node);
+	if (s >= 0 && tls_family_access == FAMILY_WRITE) {
+		ts::access_check(state->main_ptr); // Every shard node reads the main shard: its write grant covers them all.
+		return;
+	}
 	ts::access_check(s < 0 ? state->main_ptr : state->shard_ptrs[s]);
 }
 
@@ -270,6 +288,10 @@ void MacrameScene::check_read(const Node *p_node) {
 		return;
 	}
 	const int s = SceneTree::macrame_shard_of(p_node);
+	if (s >= 0 && tls_family_access != FAMILY_NONE) {
+		ts::access_check(state->main_ptr); // `gather` and `body sync` read any shard's nodes.
+		return;
+	}
 	const SceneShardToken *ptr = s < 0 ? state->main_ptr : state->shard_ptrs[s];
 	ts::access_check(ptr);
 }
@@ -328,14 +350,30 @@ void _build_phase_graph(PhaseGraph &pg, bool p_physics, ts::Guarded<PhysicsGrant
 }
 } // namespace
 
+namespace {
+// Gather groups outside the frame graph: the blue thread runs them once the batch is joined, which
+// is where stock Godot runs a later-ordered group, and where nothing else touches the shards.
+void _run_gather_on_blue(SceneTree *p_tree, const std::vector<void *> &p_groups, bool p_physics) {
+	for (void *g : p_groups) {
+		p_tree->macrame_process_group(g, p_physics);
+	}
+}
+} // namespace
+
 void MacrameScene::run_groups(SceneTree *p_tree, void **p_groups, int p_group_count, bool p_physics) {
 	ERR_FAIL_NULL(state);
 	ts::Guarded<PhysicsGrantToken> *space = MacramePhysics::get_guarded();
 	ERR_FAIL_NULL_MSG(space, "Macrame: the physics server did not register its guarded space.");
 
-	// Bucket the groups by shard.
+	// Bucket the groups by shard, gather groups apart.
 	std::vector<std::vector<void *>> buckets(SHARD_COUNT);
+	std::vector<void *> gather;
+	bool any_shard_group = false;
 	for (int i = 0; i < p_group_count; i++) {
+		if (p_tree->macrame_is_gather_group(p_groups[i])) {
+			gather.push_back(p_groups[i]);
+			continue;
+		}
 		const int s = p_tree->macrame_shard_of_group(p_groups[i]);
 		if (s < 0) {
 			// A sub-thread group with no shard yet: run it on the blue thread.
@@ -343,13 +381,35 @@ void MacrameScene::run_groups(SceneTree *p_tree, void **p_groups, int p_group_co
 			continue;
 		}
 		buckets[s].push_back(p_groups[i]);
+		any_shard_group = true;
 	}
 
 	if (state->frame.capturing) {
-		// Frame-graph mode: a graph runs this batch; groups without a shard already ran above.
+		// Frame-graph mode: a graph runs this batch; groups without a shard already ran above. A phase
+		// can hand over more than one threaded batch - a gather group sits in a later
+		// `process_thread_group_order`, so that stock Godot runs it after the shards - so batches are
+		// appended, never swapped: a swap dropped the earlier batch's shard groups. Two batches of
+		// shard groups lose their mutual order inside one graph phase, which is worth saying.
 		std::vector<std::vector<void *>> &dst = p_physics ? state->frame.tick_buckets : state->frame.frame_buckets;
-		dst.swap(buckets);
+		if (any_shard_group) {
+			for (const std::vector<void *> &b : dst) {
+				if (!b.empty()) {
+					ERR_PRINT_ONCE("Macrame: two threaded batches of shard groups in one phase; the frame graph runs them as one, unordered.");
+					break;
+				}
+			}
+			for (int s = 0; s < SHARD_COUNT; s++) {
+				dst[s].insert(dst[s].end(), buckets[s].begin(), buckets[s].end());
+			}
+		}
+		std::vector<void *> &gather_dst = p_physics ? state->frame.gather_tick_groups : state->frame.gather_frame_groups;
+		gather_dst.insert(gather_dst.end(), gather.begin(), gather.end());
 		state->frame.tree = p_tree;
+		return;
+	}
+
+	if (!any_shard_group) {
+		_run_gather_on_blue(p_tree, gather, p_physics); // A batch of gather groups alone.
 		return;
 	}
 
@@ -363,6 +423,7 @@ void MacrameScene::run_groups(SceneTree *p_tree, void **p_groups, int p_group_co
 		pg.physics = p_physics;
 		pg.buckets.swap(buckets);
 		pg.graph.execute().sync(); // One run at a time; the phases are sequential on the main thread.
+		_run_gather_on_blue(p_tree, gather, p_physics);
 		++pg.runs;
 		if (pg.runs == trace_warmup_runs()) {
 			pg.graph.set_trace(&pg.trace); // From here on: populated runs only.
@@ -398,6 +459,7 @@ void MacrameScene::run_groups(SceneTree *p_tree, void **p_groups, int p_group_co
 	for (ts::Task<void> &t : tasks) {
 		t.sync();
 	}
+	_run_gather_on_blue(p_tree, gather, p_physics);
 }
 
 namespace {
@@ -428,12 +490,42 @@ void _run_bucket(const std::vector<void *> &p_groups, int p_shard, bool p_physic
 	set_context(-1, false);
 }
 
+// `gather` (see macrame_scene.h): the tick's gather groups, on a worker, holding the main shard's
+// write grant: it covers their own nodes (main-shard nodes) and a read of any shard's node.
+void _run_gather(const std::vector<void *> &p_groups, bool p_physics) {
+	if (p_groups.empty()) {
+		return;
+	}
+	ScriptServer::thread_enter();
+	set_context(-1, true, FAMILY_READ);
+	for (void *g : p_groups) {
+		state->frame.tree->macrame_process_group(g, p_physics);
+	}
+	set_context(-1, false);
+}
+
+// `body sync` (see macrame_scene.h): the step's state callbacks at the tail of the tick that
+// stepped. The rigid bodies may live in any shard or in the main one, so it writes both.
+void _body_sync() {
+	if (state->frame.tree && state->frame.tree->is_physics_interpolation_enabled()) {
+		return; // The head delivers them, after `iteration_prepare` has snapshotted the transforms.
+	}
+	ScriptServer::thread_enter();
+	set_context(-1, true, FAMILY_WRITE);
+	static_cast<PhysicsServer3DWrapMT *>(PhysicsServer3D::get_singleton())->macrame_flush_queries_under_grant();
+	set_context(-1, false);
+	queries_flushed = true;
+}
+
 // The three frame graphs are built from this one function; `with_tick` / `with_frame` select the
 // shape. The bodies are the same lambdas over the same `FrameState` and the same guarded objects,
-// so a node means exactly one thing whichever graph it belongs to, and no node ever runs empty.
+// so a node means exactly one thing whichever graph it belongs to. Only `gather` can run empty (a
+// tick in a scene with no gather group).
 void _build_frame_graph(FrameGraph &fg, ts::Guarded<PhysicsGrantToken> *p_space) {
 	FrameState &fs = state->frame;
 	std::vector<ts::Graph_node> tick_nodes;
+	std::vector<ts::Graph_node> frame_nodes;
+	ts::Graph_node step;
 	if (fg.with_tick) {
 		tick_nodes.reserve(MacrameScene::SHARD_COUNT);
 		for (int s = 0; s < MacrameScene::SHARD_COUNT; s++) {
@@ -446,9 +538,10 @@ void _build_frame_graph(FrameGraph &fg, ts::Guarded<PhysicsGrantToken> *p_space)
 		}
 		// The step writes the space every tick shard read: compile() derives the edges. It also
 		// applies the tick's staged body writes first (upstream FIFO semantics).
-		fg.graph.add_node("physics step", [&fs](PhysicsGrantToken &) {
+		step = fg.graph.add_node("physics step", [&fs](PhysicsGrantToken &) {
 			static_cast<PhysicsServer3DWrapMT *>(PhysicsServer3D::get_singleton())->macrame_step_under_grant(fs.tick_step);
-		}, *p_space).set_priority(ts::Priority::high);
+		}, *p_space);
+		step.set_priority(ts::Priority::high);
 		fg.graph.add_node("navigation", [&fs](NavGrantToken &) {
 			NavigationServer3D::get_singleton()->physics_process(fs.tick_step);
 		}, *state->nav_guard).set_priority(ts::Priority::high);
@@ -467,7 +560,32 @@ void _build_frame_graph(FrameGraph &fg, ts::Guarded<PhysicsGrantToken> *p_space)
 			if (fg.with_tick) {
 				n.after(tick_nodes[s]);
 			}
+			frame_nodes.push_back(n);
 		}
+	}
+	if (fg.with_tick) {
+		// `gather`: after every shard node of the run. Its main-shard write orders it there anyway,
+		// since every shard node reads the main shard; the explicit edges say it is meant.
+		ts::Graph_node gather = fg.graph.add_node("gather", [&fs](SceneShardToken &) {
+			_run_gather(fs.gather_tick_groups, true);
+		}, *state->main_shard);
+		for (const ts::Graph_node &n : tick_nodes) {
+			gather.after(n);
+		}
+		for (const ts::Graph_node &n : frame_nodes) {
+			gather.after(n);
+		}
+		// `body sync`: after the step whose results it delivers, and after every frame shard, so the
+		// frame's `_process` sees the previous tick's transforms. Declared after `gather`, so the two
+		// writers of the main shard take it in that order: gather is ready first.
+		ts::Graph_node body_sync = fg.graph.add_node("body sync", [](PhysicsGrantToken &, SceneShardToken &) {
+			_body_sync();
+		}, *p_space, *state->main_shard);
+		body_sync.after(step);
+		for (const ts::Graph_node &n : frame_nodes) {
+			body_sync.after(n);
+		}
+		body_sync.set_priority(ts::Priority::high);
 	}
 	if (fg.with_frame && render_node_adder) {
 		// `render` and `submit`. They declare the render server's and the device's guarded
@@ -497,6 +615,8 @@ void _frame_run(FrameGraph &fg, SceneTree *p_tree) {
 	graph_kind = fg.kind;
 	fg.graph.execute().sync();
 	graph_kind = 3;
+	// A gather group's `_process`, on the blue thread after the run (see macrame_scene.h).
+	_run_gather_on_blue(p_tree, fs.gather_frame_groups, false);
 	// Both sides, unconditionally: a phase that captured a batch and then quit the iteration
 	// (`physics_process` returning true) must not leave it for the next run's graph.
 	for (auto &b : fs.tick_buckets) {
@@ -505,6 +625,8 @@ void _frame_run(FrameGraph &fg, SceneTree *p_tree) {
 	for (auto &b : fs.frame_buckets) {
 		b.clear();
 	}
+	fs.gather_tick_groups.clear();
+	fs.gather_frame_groups.clear();
 	++fg.runs;
 	if (fg.runs == trace_warmup_runs()) {
 		fg.graph.set_trace(&fg.trace); // From here on: populated runs only.
@@ -550,6 +672,12 @@ void MacrameScene::frame_set_tick(double p_step) {
 	state->frame.tick_step = p_step;
 }
 
+bool MacrameScene::frame_take_queries_flushed() {
+	const bool flushed = queries_flushed;
+	queries_flushed = false;
+	return flushed;
+}
+
 void MacrameScene::frame_execute_tick(SceneTree *p_tree) {
 	ERR_FAIL_NULL(state);
 	ERR_FAIL_NULL(state->graphs);
@@ -590,6 +718,7 @@ int MacrameScene::frame_graph_kind() { return 3; }
 void MacrameScene::frame_set_graph_running(bool) {}
 void MacrameScene::frame_set_capturing(bool) {}
 void MacrameScene::frame_set_tick(double) {}
+bool MacrameScene::frame_take_queries_flushed() { return false; }
 void MacrameScene::frame_execute_tick(SceneTree *) {}
 void MacrameScene::frame_execute(SceneTree *, bool) {}
 

@@ -107,6 +107,7 @@ private:
 		Node *owner = nullptr;
 		uint64_t last_pass = 0;
 		int macrame_shard = -1; // Macrame scene shard (-1: main shard).
+		bool macrame_gather = false; // A Macrame gather group: reads every shard, writes the main shard (see `MacrameScene`).
 	};
 
 	struct ProcessGroupSort {
@@ -244,6 +245,7 @@ public:
 	// Macrame shards: the shard a node's process group was assigned to (-1: main shard).
 	static int macrame_shard_of(const Node *p_node);
 	int macrame_shard_of_group(void *p_group) const { return ((ProcessGroup *)p_group)->macrame_shard; }
+	bool macrame_is_gather_group(void *p_group) const { return ((ProcessGroup *)p_group)->macrame_gather; }
 	void macrame_process_group(void *p_group, bool p_physics) { _process_group((ProcessGroup *)p_group, p_physics); }
 	// After the frame graph ran the captured shard batches: the flushes the phases do after their groups.
 	void macrame_post_shards();
